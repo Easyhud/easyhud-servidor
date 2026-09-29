@@ -1,0 +1,14 @@
+services:
+  easyhud-servidor:
+    image: easyhud/easyhud-servidor
+    build: .
+    container_name: easyhud-servidor
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "5100:5100" # ingesta: observador y jugadores
+      - "5200:5200" # salida: overlays, panel y /operador
+      - "5101:5101" # extras HTTP: GET /status
+    volumes:
+      - ./keys:/app/keys
+      - ./replays:/app/replays # antes no se montaba y las grabaciones se perdían al recrear

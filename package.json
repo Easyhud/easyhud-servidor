@@ -1,0 +1,26 @@
+{
+  "name": "easyhud-servidor-partidas",
+  "version": "2.0.0",
+  "description": "Servidor de partidas de Easy HUD: relé socket.io entre el observador, los jugadores y los overlays. Implementación original de Easy HUD.",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/index.ts",
+    "token": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/herramientas/token.ts",
+    "reproduce": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/herramientas/reproductor.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "socket.io": "4.8.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "socket.io-client": "4.8.4",
+    "typescript": "5.9.3"
+  }
+}
