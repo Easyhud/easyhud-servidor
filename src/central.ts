@@ -138,6 +138,26 @@ export class Central {
     return vivo;
   }
 
+  /**
+   * Otro observador (autenticado para el grupo) retoma un partido huérfano.
+   * El estado SIGUE: antes se destruía y se creaba uno nuevo, y con él se
+   * perdían a mitad de mapa los rosters (GEP no los repite), el marcador, el
+   * historial, los tiempos muertos y las órdenes del operador (lados e
+   * identidad intercambiados), así que los equipos «se cambiaban» al
+   * reconectar. Si lo que llega es otra partida, el `match_start` con otro
+   * matchId la reinicia (ver `reiniciaParaPartidaNueva`). Devuelve el secreto nuevo.
+   */
+  retoma(grupo: string, dueno: string): string | undefined {
+    const p = this.partidos.get(grupo);
+    if (!p) return undefined;
+    p.dueno = dueno;
+    p.secreto = nuevoSecreto();
+    p.version += 1;
+    this.usoGrupo.set(grupo, this.ahora());
+    log(`partido del grupo ${grupo} retomado por otro observador (el estado se conserva)`);
+    return p.secreto;
+  }
+
   /** Destruye el partido: cierra la grabación y echa a observador y jugadores del grupo. */
   destruye(grupo: string, motivo: string): void {
     const p = this.partidos.get(grupo);
@@ -170,6 +190,9 @@ export class Central {
     if (!r.cambiado) return;
     p.estado = r.estado;
     p.version += 1;
+    // «Switch teams»: la identidad cambiada vale también para el partido
+    // siguiente del grupo (el panel ya intercambia la serie a la vez).
+    if (evento.type === 'swap_identity') intercambiaEquiposGuardados(this.memorias.get(grupo));
     if (r.finDeMapa) {
       // El estado final SÍ se emite (antes el partido se destruía sin mandarlo).
       this.envia(p);
@@ -338,6 +361,10 @@ export class Central {
     clearInterval(this.limpieza);
     clearInterval(this.revision);
   }
+}
+
+function intercambiaEquiposGuardados(m: MemoriaGrupo | undefined): void {
+  if (m) m.equipos = [m.equipos[1], m.equipos[0]];
 }
 
 /** Los puuids de las listas de la sala, en orden y con repeticiones. */

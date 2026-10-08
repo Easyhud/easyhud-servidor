@@ -8,7 +8,7 @@
  */
 
 import { agenteDeIconoKillfeed, agenteNormalizado, nombreAgente, nombreArma, nombreEscudo } from './tablas.ts';
-import { nuevoJugador } from './creacion.ts';
+import { historialInicial, nuevoJugador, type AltaJugador } from './creacion.ts';
 import { atacaEquipoCero } from './bandos.ts';
 import type { Equipo, Jugador, Partido } from './tipos.ts';
 
@@ -153,6 +153,70 @@ function recalculaGasto(e: Equipo): void {
   e.spentThisRound = e.players.reduce((s, j) => s + j.moneySpent, 0);
 }
 
+/* ── Altas ───────────────────────────────────────────────────────────────── */
+
+/**
+ * ¿Es de una partida anterior? Nadie le ha visto en un roster (ni dado de
+ * alta por marcador) desde el último paquete de juego. Sin juego todavía,
+ * nadie lo es.
+ */
+function esDeOtraPartida(p: Partido, j: Jugador): boolean {
+  const ultima = p.interno.ultimaJugada;
+  if (ultima === undefined) return false;
+  const visto = p.interno.rosterVisto[j.riotId];
+  return visto === undefined || visto <= ultima;
+}
+
+/**
+ * Hace sitio en `equipo` para un jugador nuevo. Lleno de jugadores de esta
+ * partida, no hay sitio (tope de cinco); si alguno es de una partida anterior
+ * (partido viejo que recibe una partida nueva), se le saca.
+ */
+function haySitio(p: Partido, equipo: Equipo): boolean {
+  if (equipo.players.length < MAX_JUGADORES) return true;
+  const viejo = equipo.players.findIndex((j) => esDeOtraPartida(p, j));
+  if (viejo === -1) return false;
+  equipo.players.splice(viejo, 1);
+  equipo.playerCount = equipo.players.length;
+  return true;
+}
+
+/**
+ * Un jugador que aparece en `equipo` y está apuntado en el OTRO equipo de
+ * juego: en una misma partida nadie cambia de equipo, así que lo apuntado es
+ * de una partida anterior (remake tras una desconexión, grupo retomado). Se
+ * le saca del otro para que no salga dos veces ni con el equipo equivocado.
+ */
+function sacaDelOtroEquipo(p: Partido, equipo: Equipo, playerId: string): void {
+  for (const otro of p.teams) {
+    if (otro === equipo) continue;
+    const i = otro.players.findIndex((j) => j.riotId === playerId);
+    if (i === -1) continue;
+    otro.players.splice(i, 1);
+    otro.playerCount = otro.players.length;
+  }
+}
+
+/** Alta de un jugador en su equipo de juego. Devuelve el jugador, o undefined si no cabe. */
+function daDeAlta(p: Partido, equipo: Equipo, a: AltaJugador, ahora: number): Jugador | undefined {
+  sacaDelOtroEquipo(p, equipo, a.playerId);
+  if (!haySitio(p, equipo)) return undefined;
+  const j = nuevoJugador(a);
+  equipo.players.push(j);
+  equipo.playerCount = equipo.players.length;
+  p.interno.rosterVisto[a.playerId] = ahora;
+
+  // En selección de agentes el equipo del juego 0 empieza atacando. Un alta
+  // tardía (con rondas ya jugadas) ya no toca el bando: antes lo devolvía al
+  // inicial, que en la segunda mitad es el equivocado.
+  const rondasJugadas = p.interno.ultimoMarcador[0] + p.interno.ultimoMarcador[1];
+  if (rondasJugadas === 0 && p.interno.ultimoCambioLado === 0) {
+    const ataca0 = atacaEquipoCero(p, 1) !== p.interno.bandosInvertidos;
+    equipo.isAttacking = (equipo.ingameTeamId === 0) === ataca0;
+  }
+  return j;
+}
+
 /* ── Paquetes ───────────────────────────────────────────────────────────── */
 
 /** `roster`: alta o actualización de un jugador. Devuelve false si el equipo no existe. */
@@ -177,41 +241,49 @@ export function aplicaRoster(p: Partido, d: Record<string, unknown>, ahora: numb
     cambiaAgente(existente, agente);
     existente.locked = d.locked === true;
     if (esNumero(d.rank) && d.rank > 0) existente.rank = d.rank;
+    p.interno.rosterVisto[playerId] = ahora;
     return true;
   }
 
-  if (equipo.players.length >= MAX_JUGADORES) return true;
-
-  equipo.players.push(
-    nuevoJugador({
-      name: nombre,
-      tagline: tag,
-      playerId,
-      position: num(d.position),
-      locked: d.locked === true,
-      agentInternal: agente,
-      rank: num(d.rank),
-    }),
+  daDeAlta(
+    p,
+    equipo,
+    { playerId, name: nombre, tagline: tag, agentInternal: agente, position: num(d.position), locked: d.locked === true, rank: num(d.rank) },
+    ahora,
   );
-  equipo.playerCount += 1;
-
-  // En selección de agentes el equipo del juego 0 empieza atacando. Un alta
-  // tardía (con rondas ya jugadas) ya no toca el bando: antes lo devolvía al
-  // inicial, que en la segunda mitad es el equivocado.
-  const rondasJugadas = p.interno.ultimoMarcador[0] + p.interno.ultimoMarcador[1];
-  if (rondasJugadas === 0 && p.interno.ultimoCambioLado === 0) {
-    const ataca0 = atacaEquipoCero(p, 1) !== p.interno.bandosInvertidos;
-    equipo.isAttacking = (equipo.ingameTeamId === 0) === ataca0;
-  }
   return true;
 }
 
-/** `scoreboard` del observador. Devuelve false si el equipo no existe. */
+/**
+ * `scoreboard` del observador. Devuelve false si el equipo no existe.
+ *
+ * Si el jugador no tiene roster, el marcador lo da de alta: un observador que
+ * retoma el grupo a mitad de mapa no vuelve a recibir los rosters (GEP sólo
+ * los manda al cambiar), y sin esto el overlay se quedaba sin jugadores el
+ * resto del mapa. El marcador trae lo necesario (puuid, nombre, equipo, agente).
+ */
 export function aplicaMarcadorObservador(p: Partido, d: Record<string, unknown>, ahora: number): boolean {
   const equipo = equipoDeJuego(p, d.startTeam);
   if (!equipo) return false;
-  const j = equipo.players.find((x) => x.riotId === d.playerId);
-  detectaPlantadoPorDinero(p, j, d.money, ahora);
+  const previo = equipo.players.find((x) => x.riotId === d.playerId);
+  detectaPlantadoPorDinero(p, previo, d.money, ahora);
+  let j = previo;
+  if (!j && typeof d.playerId === 'string' && d.playerId !== '' && typeof d.name === 'string' && d.name !== '') {
+    j = daDeAlta(
+      p,
+      equipo,
+      {
+        playerId: d.playerId,
+        name: d.name,
+        tagline: typeof d.tagline === 'string' ? d.tagline : '',
+        agentInternal: typeof d.agentInternal === 'string' ? d.agentInternal : '',
+        position: equipo.players.length,
+        locked: true,
+        rank: 0,
+      },
+      ahora,
+    );
+  }
   if (!j) return true;
   actualizaMarcador(j, d, p.roundPhase);
   j.scoreboardAvailable = true;
@@ -219,15 +291,19 @@ export function aplicaMarcadorObservador(p: Partido, d: Record<string, unknown>,
   return true;
 }
 
-/** `aux_scoreboard`: el marcador del propio jugador, sólo si el observador no lo dio ya. */
+/**
+ * `aux_scoreboard`: el marcador del propio jugador, sólo si el observador no
+ * lo dio ya. El jugador se busca por su puuid en los dos equipos: el `team`
+ * que manda el GEP del jugador no tiene por qué ser el del observador, y un
+ * aux_scoreboard nunca da de alta ni mueve a nadie.
+ */
 export function aplicaMarcadorPropio(p: Partido, d: Record<string, unknown>, ahora: number): boolean {
-  const equipo = equipoDeJuego(p, d.startTeam);
-  if (!equipo) return false;
-  const j = equipo.players.find((x) => x.riotId === d.playerId);
-  detectaPlantadoPorDinero(p, j, d.money, ahora);
-  if (!j || j.scoreboardAvailable) return true;
-  actualizaMarcador(j, d, p.roundPhase);
-  j.auxiliaryAvailable.scoreboard = true;
+  const r = jugadorPorId(p, d.playerId);
+  detectaPlantadoPorDinero(p, r?.jugador, d.money, ahora);
+  if (!r) return false;
+  if (r.jugador.scoreboardAvailable) return true;
+  actualizaMarcador(r.jugador, d, p.roundPhase);
+  r.jugador.auxiliaryAvailable.scoreboard = true;
   return true;
 }
 
@@ -427,4 +503,57 @@ export function marcaObservado(p: Partido, dato: unknown): void {
   for (const equipo of p.teams) {
     for (const j of equipo.players) j.isObserved = j.searchName === dato;
   }
+}
+
+/* ── Partida nueva en un partido viejo ──────────────────────────────────── */
+
+/**
+ * Llegó una partida de VALORANT distinta (otro matchId) a un partido que ya
+ * tenía una: remake tras una desconexión (el observador vuelve al menú sin
+ * `game_end` y el partido sigue vivo, o vuelve a entrar con su secreto), o un
+ * grupo huérfano que se retoma. Se empieza el mapa de cero: marcador,
+ * historial, bandos, tiempos muertos y estadísticas. Se conservan la
+ * configuración, la identidad de cada lado y los jugadores que ya mandaron
+ * roster de la partida nueva (llega en la selección de agentes, antes del
+ * `match_start`); los demás se van y, si siguen jugando, vuelven con su marcador.
+ */
+export function reiniciaParaPartidaNueva(p: Partido): void {
+  const max = p.tools.timeoutMax;
+  for (const equipo of p.teams) {
+    const ataca = equipo.ingameTeamId === 0;
+    equipo.isAttacking = ataca;
+    equipo.roundsWon = 0;
+    equipo.spentThisRound = 0;
+    equipo.roundRecord = historialInicial(ataca);
+    equipo.hasDuplicateAgents = false;
+    equipo.players = equipo.players
+      .filter((j) => !esDeOtraPartida(p, j))
+      .map((j) =>
+        nuevoJugador({
+          name: j.name,
+          tagline: j.tagline,
+          playerId: j.riotId,
+          position: j.position,
+          locked: j.locked,
+          agentInternal: j.agentInternal,
+          rank: j.rank,
+        }),
+      );
+    equipo.playerCount = equipo.players.length;
+  }
+  p.roundNumber = 0;
+  p.roundPhase = 'LOBBY';
+  p.roundTimeoutTime = undefined;
+  p.wasTimeout = false;
+  p.spikeDetonationTime = undefined;
+  p.spikeState = { planted: false, detonated: false, defused: false };
+  p.attackersWon = false;
+  const i = p.interno;
+  i.tiempos = { restantes: [max, max], activo: null, pausaTecnica: false, segundosRestantes: 0, prorrogaConcedida: false };
+  i.ultimoMarcador = [0, 0];
+  i.limiteRonda = undefined;
+  i.finRonda = undefined;
+  i.ultimoCambioLado = 0;
+  i.bandosInvertidos = false;
+  i.ultimaJugada = undefined;
 }

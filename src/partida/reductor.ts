@@ -26,6 +26,7 @@ import {
   marcaObservado,
   plantaSpike,
   quitaDisponibilidad,
+  reiniciaParaPartidaNueva,
   reiniciaRonda,
   revisaAgentesDuplicados,
 } from './jugadores.ts';
@@ -46,6 +47,7 @@ import {
 } from './creacion.ts';
 import { nombreMapa } from './tablas.ts';
 import { fijaBandos, rondaEnJuego } from './bandos.ts';
+import { intercambiaIdentidad, intercambiaRegistrados, vinculaPorRoster } from './vinculo.ts';
 import type { Equipo, Evento, Paquete, Partido, TipoRonda } from './tipos.ts';
 
 const LIMITE_RONDA_MS = 99_000;
@@ -110,10 +112,15 @@ function aplica(p: Partido, e: Evento): Efecto {
   const dato = esObjeto(d) ? d : {};
 
   switch (paquete.type) {
-    case 'roster':
-      return si(aplicaRoster(p, dato, t));
-    case 'scoreboard':
-      return si(aplicaMarcadorObservador(p, dato, t));
+    // Tras cada roster o marcador, el vínculo por puuid (si el panel los mandó).
+    case 'roster': {
+      const c = aplicaRoster(p, dato, t);
+      return si(vinculaPorRoster(p) || c);
+    }
+    case 'scoreboard': {
+      const c = aplicaMarcadorObservador(p, dato, t);
+      return si(vinculaPorRoster(p) || c);
+    }
     case 'killfeed':
       aplicaKillfeed(p, dato);
       return HECHO;
@@ -121,10 +128,19 @@ function aplica(p: Partido, e: Evento): Efecto {
       marcaObservado(p, d);
       return HECHO;
 
-    case 'match_start':
-      p.matchId = typeof d === 'string' ? d : String(d ?? '');
+    case 'match_start': {
+      const id = typeof d === 'string' ? d : String(d ?? '');
+      // Otra partida en el mismo partido (remake sin game_end, grupo retomado):
+      // se empieza de cero. El mismo id (reconexión) no toca nada, y uno
+      // vacío no borra el que hay: los jugadores entran por matchId.
+      if (id !== '' && p.matchId !== '' && id !== p.matchId) {
+        reiniciaParaPartidaNueva(p);
+        vinculaPorRoster(p);
+      }
+      if (id !== '') p.matchId = id;
       p.isRunning = true;
       return HECHO;
+    }
     case 'map':
       p.map = nombreMapa(d);
       return HECHO;
@@ -135,6 +151,7 @@ function aplica(p: Partido, e: Evento): Efecto {
     case 'round_info':
       return aplicaFase(p, dato, t);
     case 'score':
+      p.interno.ultimaJugada = t;
       aplicaMarcadorRondas(p, dato, t);
       return HECHO;
 
@@ -163,12 +180,14 @@ function aplica(p: Partido, e: Evento): Efecto {
 
     case 'swap_left_right':
       p.teams = [p.teams[1], p.teams[0]];
+      intercambiaRegistrados(p);
       return HECHO;
     case 'swap_attacker_defender':
       intercambiaBandos(p);
       return HECHO;
     case 'swap_identity':
       intercambiaIdentidad(p.teams[0], p.teams[1]);
+      intercambiaRegistrados(p);
       return HECHO;
 
     case 'aux_health':
@@ -208,6 +227,8 @@ function aplicaFase(p: Partido, d: Record<string, unknown>, ahora: number): Efec
   const faseAnterior = p.roundPhase;
   if (esNumero(d.roundNumber)) p.roundNumber = d.roundNumber;
   if (typeof d.roundPhase === 'string') p.roundPhase = d.roundPhase;
+
+  if (p.roundPhase === 'shopping' || p.roundPhase === 'combat' || p.roundPhase === 'end') p.interno.ultimaJugada = ahora;
 
   switch (p.roundPhase) {
     case 'shopping': {
@@ -368,10 +389,4 @@ function intercambiaBandos(p: Partido): void {
   b.isAttacking = !b.isAttacking;
   [a.roundsWon, b.roundsWon] = [b.roundsWon, a.roundsWon];
   [a.roundRecord, b.roundRecord] = [b.roundRecord, a.roundRecord];
-}
-
-function intercambiaIdentidad(a: Equipo, b: Equipo): void {
-  [a.teamName, b.teamName] = [b.teamName, a.teamName];
-  [a.teamTricode, b.teamTricode] = [b.teamTricode, a.teamTricode];
-  [a.teamUrl, b.teamUrl] = [b.teamUrl, a.teamUrl];
 }

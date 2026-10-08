@@ -9,11 +9,18 @@
  */
 
 import type { EquipoGuardado, MemoriaGrupo, Partido } from './tipos.ts';
+import { vinculaPorRoster } from './vinculo.ts';
 
 const esObjeto = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 const esNumero = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const textoNoVacio = (v: unknown): v is string => typeof v === 'string' && v !== '';
+
+/** `puuids` de un equipo del parche: lista de textos no vacíos, o undefined si no viene. */
+function puuidsDe(e: Record<string, unknown>): string[] | undefined {
+  if (!Array.isArray(e.puuids)) return undefined;
+  return [...new Set(e.puuids.filter(textoNoVacio))];
+}
 
 export function memoriaVacia(): MemoriaGrupo {
   return { equipos: [null, null] };
@@ -51,12 +58,17 @@ export function aplicaParcheGrupo(m: MemoriaGrupo, parche: Record<string, unknow
       if (textoNoVacio(e.name)) guardado.name = e.name;
       if (textoNoVacio(e.tricode)) guardado.tricode = e.tricode;
       if (typeof e.url === 'string') guardado.url = e.url;
+      const puuids = puuidsDe(e);
+      if (puuids !== undefined) guardado.puuids = puuids;
       m.equipos[i] = guardado;
     }
   }
 }
 
-/** Pone nombre/tricode/logo guardados en los equipos del partido, por posición. */
+/**
+ * Pone nombre/tricode/logo guardados en los equipos del partido, por posición,
+ * y los puuids registrados de cada lado (el vínculo por roster lo aplica quien llama).
+ */
 export function aplicaEquiposGuardados(p: Partido, equipos: ReadonlyArray<unknown>): void {
   for (const i of [0, 1] as const) {
     const e = equipos[i];
@@ -65,6 +77,8 @@ export function aplicaEquiposGuardados(p: Partido, equipos: ReadonlyArray<unknow
     if (textoNoVacio(e.name)) t.teamName = e.name;
     if (textoNoVacio(e.tricode)) t.teamTricode = e.tricode;
     if (typeof e.url === 'string') t.teamUrl = e.url;
+    const puuids = puuidsDe(e);
+    if (puuids !== undefined) p.interno.registrados[i] = puuids;
   }
 }
 
@@ -133,6 +147,7 @@ export function aplicaParchePartido(p: Partido, parche: Record<string, unknown>)
 
   if (Array.isArray(parche.equipos)) {
     aplicaEquiposGuardados(p, parche.equipos);
+    vinculaPorRoster(p);
     cambio = true;
   }
 

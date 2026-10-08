@@ -110,8 +110,8 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
       } else if (existente.dueno !== null) {
         return rechaza(`Game with Group Code ${grupo} exists and is still live.`);
       } else {
-        central.destruye(grupo, 'retomado por otro observador');
-        reason = central.crea(datosCreacion(d), cabeceraGrabacion(d), socket.id).secreto;
+        // Huérfano: lo retoma este observador, conservando el estado.
+        reason = central.retoma(grupo, socket.id) ?? central.crea(datosCreacion(d), cabeceraGrabacion(d), socket.id).secreto;
       }
 
       const sesion: Sesion = {
@@ -192,6 +192,14 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
       if (!esPaquete || typeof d.type !== 'string') return;
       if (typeof d.groupCode === 'string' && d.groupCode !== s.grupo) {
         log(`paquete de ${s.nombre} para el grupo ${d.groupCode}, pero está autenticado en ${s.grupo}: descartado`);
+        return;
+      }
+
+      // Un jugador sólo manda sus datos propios (aux_*). Antes podía mandar
+      // cualquier tipo conocido (roster, score, swap_left_right…) y mover los
+      // equipos del partido entero.
+      if (s.rol === 'jugador' && !d.type.startsWith('aux_')) {
+        log(`${d.type} de un jugador (${s.nombre}, ${s.grupo}): descartado`);
         return;
       }
 

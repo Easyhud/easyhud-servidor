@@ -169,6 +169,22 @@ export interface Interno {
   /** Tiempos muertos extra que se conceden al entrar en prórroga. */
   extraProrroga: number;
   hayRoster: boolean;
+  /**
+   * Los puuids que el panel registró para el equipo de cada LADO (0 =
+   * izquierda). Si llegan, el nombre/logo de cada lado se queda con SUS
+   * jugadores aunque en la partida sean el otro equipo de juego (ver
+   * `vinculo.ts`). Vacíos = sin vínculo (el lado manda, como siempre).
+   */
+  registrados: [string[], string[]];
+  /** Hora (ms) del último `roster` (o alta por marcador) de cada puuid. */
+  rosterVisto: Record<string, number>;
+  /**
+   * Hora del último paquete de juego (fase de ronda o marcador de rondas). Un
+   * jugador sin roster desde entonces es de una partida anterior: lo que deja
+   * reconocer una partida nueva que llega a un partido viejo (remake sin
+   * `game_end`, observador que retoma un grupo huérfano).
+   */
+  ultimaJugada?: number;
 }
 
 export interface Partido {
@@ -220,6 +236,8 @@ export interface EquipoGuardado {
   name?: string;
   tricode?: string;
   url?: string;
+  /** puuids de los jugadores registrados de ese equipo (ver `Interno.registrados`). */
+  puuids?: string[];
 }
 
 export interface MemoriaGrupo {

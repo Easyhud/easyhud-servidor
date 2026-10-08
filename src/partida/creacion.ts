@@ -258,6 +258,8 @@ export function creaPartido(d: DatosCreacion, memoria: MemoriaGrupo | undefined,
       bandosInvertidos: false,
       extraProrroga: op.extraProrroga,
       hayRoster: false,
+      registrados: [[], []],
+      rosterVisto: {},
     },
   };
 
