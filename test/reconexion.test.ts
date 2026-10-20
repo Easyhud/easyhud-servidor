@@ -40,6 +40,7 @@ before(async () => {
     extraProrroga: 1,
     minutosInactividad: 30,
     puertos: { ingesta: 0, salida: 0, extras: 0 },
+    camaras: { base: 'https://vdo.ninja', params: '' },
   };
   servidor = await arranca(config);
 });

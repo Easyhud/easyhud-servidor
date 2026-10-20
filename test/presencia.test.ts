@@ -18,6 +18,7 @@ const config: Config = {
   extraProrroga: 1,
   minutosInactividad: 30,
   puertos: { ingesta: 0, salida: 0, extras: 0 },
+  camaras: { base: 'https://vdo.ninja', params: '' },
 };
 
 function banco() {
@@ -27,6 +28,10 @@ function banco() {
     estado: () => undefined,
     sala: (grupo, carga) => salas.push({ grupo, conectados: carga.conectados as string[] }),
     expulsaGrupo: () => undefined,
+    camaras: () => undefined,
+    llama: () => undefined,
+    pideInforme: () => false,
+    ordenJugador: () => false,
   };
   const central = new Central(config, () => t);
   central.conecta(difusion);

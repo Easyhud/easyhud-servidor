@@ -49,6 +49,13 @@ export function aplicaParcheGrupo(m: MemoriaGrupo, parche: Record<string, unknow
     if (Number.isFinite(max) && max >= 0) m.tiempos = { ...m.tiempos, max };
   }
 
+  const camaras = parche.playercamsInfo;
+  if (esObjeto(camaras)) {
+    m.camaras ??= {};
+    if (typeof camaras.enable === 'boolean') m.camaras.enable = camaras.enable;
+    if (typeof camaras.identifier === 'string') m.camaras.identifier = camaras.identifier;
+  }
+
   const equipos = parche.equipos;
   if (Array.isArray(equipos)) {
     for (const i of [0, 1] as const) {
@@ -139,9 +146,7 @@ export function aplicaParchePartido(p: Partido, parche: Record<string, unknown>)
   if (esObjeto(camaras)) {
     if (typeof camaras.enable === 'boolean') t.playercamsInfo.enable = camaras.enable;
     if (typeof camaras.identifier === 'string') t.playercamsInfo.identifier = camaras.identifier;
-    if (Array.isArray(camaras.enabledPlayers)) {
-      t.playercamsInfo.enabledPlayers = camaras.enabledPlayers.filter((x): x is string => typeof x === 'string');
-    }
+    // `enabledPlayers` NO se acepta del panel: lo decide el servidor según quién publica.
     cambio = true;
   }
 

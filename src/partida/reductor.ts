@@ -26,13 +26,16 @@ import {
   marcaObservado,
   plantaSpike,
   quitaDisponibilidad,
+  restauraVida,
   reiniciaParaPartidaNueva,
+  reiniciaPorOrden,
   reiniciaRonda,
   revisaAgentesDuplicados,
 } from './jugadores.ts';
 import { aplicaParchePartido } from './configuracion.ts';
 import {
   alternaPausaTecnica,
+  pausaVisual,
   alternaTiempoMuerto,
   avanzaReloj,
   concedeProrroga,
@@ -72,12 +75,14 @@ export const TIPOS_CONOCIDOS = new Set([
   'aux_astra_targeting', 'aux_cypher_cam',
 ]);
 
+const EVENTOS_INTERNOS = new Set(['@reloj', '@configura', '@jugador_desconectado', '@camaras', '@reinicia_partida', '@pausa_visual', '@aux_disponible']);
+
 export function reduce(estado: Partido, evento: Evento): Resultado {
   // El reloj pasa muchas veces por segundo: si no hay nada que contar, ni se copia.
   if (evento.type === '@reloj' && !necesitaReloj(estado) && !rotuloCaduca(estado, evento.timestamp)) {
     return { estado, cambiado: false, finDeMapa: false };
   }
-  if (evento.type !== '@reloj' && evento.type !== '@configura' && evento.type !== '@jugador_desconectado') {
+  if (!EVENTOS_INTERNOS.has(evento.type)) {
     if (!TIPOS_CONOCIDOS.has(evento.type)) return { estado, cambiado: false, finDeMapa: false };
   }
 
@@ -103,8 +108,29 @@ function aplica(p: Partido, e: Evento): Efecto {
       return si(avanzaRotulo(p, t) || avanzaReloj(p, t));
     case '@configura':
       return si(aplicaParchePartido(p, (e as { parche: Record<string, unknown> }).parche));
+    case '@reinicia_partida':
+      reiniciaPorOrden(p);
+      return HECHO;
+    case '@aux_disponible':
+      return si(restauraVida(p, String((e as { playerId: string }).playerId)));
+    case '@pausa_visual':
+      return si(pausaVisual(p, (e as Extract<Evento, { type: '@pausa_visual' }>).activa === true, t));
     case '@jugador_desconectado':
       return si(quitaDisponibilidad(p, String((e as { playerId: string }).playerId)));
+    case '@camaras': {
+      const { publicando: nueva, conexion } = e as Extract<Evento, { type: '@camaras' }>;
+      const cam = p.tools.playercamsInfo;
+      let cambio = false;
+      if (nueva.length !== cam.enabledPlayers.length || nueva.some((x, i) => x !== cam.enabledPlayers[i])) {
+        cam.enabledPlayers = [...nueva];
+        cambio = true;
+      }
+      if (conexion && (cam.base !== conexion.base || cam.params !== conexion.params || cam.clave !== conexion.clave)) {
+        Object.assign(cam, conexion);
+        cambio = true;
+      }
+      return si(cambio);
+    }
   }
 
   const paquete = e as Paquete;
@@ -139,6 +165,10 @@ function aplica(p: Partido, e: Evento): Efecto {
       }
       if (id !== '') p.matchId = id;
       p.isRunning = true;
+      // La partida EMPEZÓ: si el juego aún figuraba en el lobby/selección (el `round_info` de la compra puede llegar
+      // después, o perderse si hubo un reinicio entre medias), se pasa ya a la compra. El original lo dejaba en «combat»;
+      // aquí es la compra de la ronda 1, que es lo que ocurre de verdad tras el match_start.
+      if (p.roundPhase === 'LOBBY') p.roundPhase = 'shopping';
       return HECHO;
     }
     case 'map':
@@ -160,9 +190,11 @@ function aplica(p: Partido, e: Evento): Efecto {
     case 'spike_detonated':
       p.spikeState.detonated = true;
       p.spikeDetonationTime = undefined;
+      corrigeMotivoRonda(p); // si llegó DESPUÉS del `score`, la ronda ya apuntada se corrige
       return HECHO;
     case 'spike_defused':
       p.spikeState.defused = true;
+      corrigeMotivoRonda(p);
       return HECHO;
 
     case 'switch_kda_credits':
@@ -226,20 +258,28 @@ function aplicaModo(p: Partido, d: unknown): void {
 function aplicaFase(p: Partido, d: Record<string, unknown>, ahora: number): Efecto {
   const faseAnterior = p.roundPhase;
   if (esNumero(d.roundNumber)) p.roundNumber = d.roundNumber;
-  if (typeof d.roundPhase === 'string') p.roundPhase = d.roundPhase;
+  if (typeof d.roundPhase === 'string') {
+    p.roundPhase = d.roundPhase;
+    // La pausa detectada por pantalla no puede sobrevivir a la compra: si el juego pasó a combate, ya no hay pausa.
+    if (d.roundPhase !== 'shopping') pausaVisual(p, false, ahora);
+  }
 
   if (p.roundPhase === 'shopping' || p.roundPhase === 'combat' || p.roundPhase === 'end') p.interno.ultimaJugada = ahora;
 
   switch (p.roundPhase) {
     case 'shopping': {
       p.spikeState = { planted: false, detonated: false, defused: false };
-      // Un `shopping` repetido (sin pasar por otra fase) no vuelve a reiniciar
-      // la ronda ni a cambiar de lado.
-      if (faseAnterior === 'shopping') break;
-
       // La ronda que empieza: el `roundNumber` de GEP puede ir una por detrás
       // de la fase; el marcador de rondas, no (ver `bandos.ts`).
       const enJuego = rondaEnJuego(p);
+      // Un `shopping` repetido (sin pasar por otra fase) no vuelve a reiniciar la ronda ni a cambiar de lado. Pero si
+      // el número de ronda es MAYOR que el de la última compra procesada, se perdieron `combat` y `end` entre dos
+      // rondas distintas: es ronda nueva aunque no se hayan visto las fases intermedias.
+      if (faseAnterior === 'shopping' && !(p.interno.ultimaCompra !== undefined && enJuego > p.interno.ultimaCompra)) {
+        p.interno.ultimaCompra ??= enJuego;
+        break;
+      }
+      p.interno.ultimaCompra = enJuego;
       // Y la que se difunde es esa: el overlay rotulaba «compra 12» en la 13.
       p.roundNumber = enJuego;
       if (enJuego >= p.firstOtRound) concedeProrroga(p);
@@ -251,6 +291,7 @@ function aplicaFase(p: Partido, d: Record<string, unknown>, ahora: number): Efec
       break;
     }
     case 'combat':
+      p.interno.rondaAbierta = undefined; // si se perdió la compra, el combate también cierra la corrección de la ronda anterior
       // Por si no llegó el `shopping` (observador que entra a mitad de ronda):
       // el bando se corrige aquí, sin tocar el dinero.
       p.roundNumber = rondaEnJuego(p);
@@ -266,6 +307,7 @@ function aplicaFase(p: Partido, d: Record<string, unknown>, ahora: number): Efec
       if (faseAnterior !== 'end') p.interno.finRonda = ahora;
       p.roundTimeoutTime = undefined;
       p.spikeDetonationTime = undefined;
+      corrigeMotivoRonda(p); // el `score` llegó antes que el `end`: ahora se sabe si fue por tiempo
       break;
     case 'game_end':
       p.isRunning = false;
@@ -305,6 +347,8 @@ function aplicaMarcadorRondas(p: Partido, d: Record<string, unknown>, ahora: num
     p.wasTimeout = porTiempo;
     const ronda = r0 + r1;
     for (const equipo of p.teams) apuntaRonda(equipo, ronda, motivoPara(p, equipo, ganador));
+    // Queda abierta hasta que empiece la compra siguiente: un evento de spike tardío corrige su motivo.
+    p.interno.rondaAbierta = { ronda, ganador: ganador.ingameTeamId };
   } else {
     p.wasTimeout = porTiempo;
   }
@@ -313,6 +357,25 @@ function aplicaMarcadorRondas(p: Partido, d: Record<string, unknown>, ahora: num
   if (e1) e1.roundsWon = r1;
   p.interno.ultimoMarcador = [r0, r1];
   p.spikeState.planted = false;
+}
+
+/**
+ * El evento de spike (detonada/desactivada) o el `end` pueden llegar unos instantes después del `score`. Mientras la
+ * ronda recién apuntada siga siendo la última y no haya empezado la compra siguiente, se recalcula su motivo en el
+ * historial de los dos equipos. Después queda fijo.
+ */
+function corrigeMotivoRonda(p: Partido): void {
+  const abierta = p.interno.rondaAbierta;
+  if (!abierta) return;
+  const ganador = p.teams.find((x) => x.ingameTeamId === abierta.ganador);
+  if (!ganador) return;
+  const fin = p.interno.finRonda;
+  const limite = p.roundTimeoutTime ?? p.interno.limiteRonda;
+  if (fin !== undefined && limite !== undefined) p.wasTimeout = fin >= limite;
+  for (const equipo of p.teams) {
+    const entrada = equipo.roundRecord[abierta.ronda - 1];
+    if (entrada && entrada.round === abierta.ronda && entrada.type !== 'upcoming') entrada.type = motivoPara(p, equipo, ganador);
+  }
 }
 
 function motivoPara(p: Partido, equipo: Equipo, ganador: Equipo): TipoRonda {

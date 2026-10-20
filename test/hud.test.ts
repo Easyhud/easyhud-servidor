@@ -140,6 +140,9 @@ test('desconectado: muerto en plena compra = fuera del mapa; no reaparece hasta 
   b.fase(2, 'shopping');
   assert.equal(j().isAlive, true, 'todo el mundo reaparece');
   marcador(b, { isAlive: false, deaths: 1, money: 5000 });
+  assert.equal(j().disconnected, false, 'un solo marcador muerto en compra no basta');
+  b.t += 3_500;
+  marcador(b, { isAlive: false, deaths: 1, money: 5000 });
   assert.equal(j().disconnected, true);
   assert.equal(j().isAlive, false);
 

@@ -55,6 +55,7 @@ export function alternaTiempoMuerto(p: Partido, lado: Lado, ahora: number): bool
 
   cortaTactico(p, ahora); // el del otro equipo, si lo había
   t.pausaTecnica = false;
+  t.automatica = false;
   t.restantes[equipo] -= 1;
   t.activo = { equipo, inicio: ahora };
   t.segundosRestantes = p.tools.timeoutDuration;
@@ -64,6 +65,7 @@ export function alternaTiempoMuerto(p: Partido, lado: Lado, ahora: number): bool
 /** Interruptor de la pausa técnica. */
 export function alternaPausaTecnica(p: Partido, ahora: number): boolean {
   const t = p.interno.tiempos;
+  t.automatica = false;
   if (t.pausaTecnica) {
     t.pausaTecnica = false;
     t.segundosRestantes = 0;
@@ -73,6 +75,38 @@ export function alternaPausaTecnica(p: Partido, ahora: number): boolean {
   t.pausaTecnica = true;
   // La pausa técnica no tiene fin; el overlay muestra su cuenta desde la duración entera.
   t.segundosRestantes = p.tools.timeoutDuration;
+  return true;
+}
+
+/**
+ * La pantalla del juego se ve en gris (lo hace VALORANT en cada tiempo muerto y pausa técnica) o ha vuelto el color.
+ * Sin que el operador tenga que pulsar nada: se pone la pausa (para que el overlay la enseñe y se pare la cuenta de la
+ * spike) y se quita sola cuando vuelve el color. No gasta tiempos muertos —no se sabe qué equipo lo pidió— y no pisa
+ * lo que ya esté en marcha: si el operador puso un táctico, sigue el suyo.
+ * Los tiempos muertos y la pausa técnica sólo se piden en la FASE DE COMPRA: fuera de ella no se hace caso (es la pista que evita equivocarse con pantallas grises de otro tipo).
+ */
+export function pausaVisual(p: Partido, activa: boolean, ahora: number): boolean {
+  const t = p.interno.tiempos;
+  const enJuego = p.isRunning && p.roundPhase === 'shopping';
+  if (activa) {
+    if (!enJuego || t.visual === true) return false;
+    t.visual = true;
+    // Si el operador ya había puesto algo a mano, se respeta; si no, entra como pausa técnica (aún no se sabe quién fue).
+    if (t.pausaTecnica || t.activo !== null) return true;
+    t.pausaTecnica = true;
+    t.automatica = true;
+    t.segundosRestantes = p.tools.timeoutDuration;
+    return true;
+  }
+  if (t.visual !== true) return false;
+  // Vuelve el color: la pausa de pantalla se acabó, sea la técnica automática o el timeout que el operador asignó después.
+  t.visual = false;
+  if (t.automatica === true) {
+    t.pausaTecnica = false;
+    t.automatica = false;
+  }
+  if (t.activo !== null && ahora - t.activo.inicio > 0) t.activo = null;
+  t.segundosRestantes = t.activo === null ? 0 : t.segundosRestantes;
   return true;
 }
 
@@ -115,6 +149,8 @@ export function detenTodo(p: Partido): void {
   const t = p.interno.tiempos;
   t.activo = null;
   t.pausaTecnica = false;
+  t.automatica = false;
+  t.visual = false;
   t.segundosRestantes = 0;
 }
 

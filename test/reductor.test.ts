@@ -226,11 +226,11 @@ test('swift: cambio en la 5 y sin prórroga', () => {
   assert.equal(b.estado.teams[0].isAttacking, false);
 });
 
-test('mapas: nombre visible, desconocido → Corrode, Piazza sin espacio', () => {
+test('mapas: nombre visible, desconocido tal cual (nunca otro mapa), Piazza sin espacio', () => {
   const b = new Banco().manda('map', 'Infinityy');
   assert.equal(b.estado.map, 'Abyss');
   assert.equal(b.manda('map', 'HURM_Yard').estado.map, 'Piazza');
-  assert.equal(b.manda('map', 'Nuevo').estado.map, 'Corrode');
+  assert.equal(b.manda('map', 'Nuevo').estado.map, 'Nuevo', 'un código que no se conoce no se traduce a otro mapa');
 });
 
 /* ── Killfeed ───────────────────────────────────────────────────────────── */
@@ -364,9 +364,23 @@ test('configura: parche de torneo, cámaras y equipos', () => {
   const s = aSalida(b.estado);
   assert.equal(s.tools.tournamentInfo.name, 'Copa');
   assert.equal(s.tools.tournamentInfo.logoUrl, '');
-  assert.deepEqual(s.tools.playercamsInfo, { enable: true, identifier: 'sala', enabledPlayers: ['A#1'] });
+  assert.deepEqual(s.tools.playercamsInfo, { enable: true, identifier: 'sala', enabledPlayers: [] });
   assert.equal(s.teams[1].teamName, 'Nuevo');
   assert.equal(s.teams[1].teamTricode, 'DER', 'tricode vacío no pisa');
+});
+
+test('cámaras: quién publica lo fija el servidor, el panel no puede', () => {
+  const b = new Banco();
+  b.evento({ type: '@camaras', timestamp: b.t, publicando: ['A#1', 'B#2'] });
+  assert.deepEqual(aSalida(b.estado).tools.playercamsInfo.enabledPlayers, ['A#1', 'B#2']);
+  b.evento({
+    type: '@configura',
+    timestamp: b.t,
+    parche: { playercamsInfo: { enable: true, enabledPlayers: ['Falso#9'] } },
+  });
+  assert.deepEqual(aSalida(b.estado).tools.playercamsInfo.enabledPlayers, ['A#1', 'B#2']);
+  b.evento({ type: '@camaras', timestamp: b.t, publicando: [] });
+  assert.deepEqual(aSalida(b.estado).tools.playercamsInfo.enabledPlayers, []);
 });
 
 /* ── Serialización ──────────────────────────────────────────────────────── */
@@ -383,4 +397,68 @@ test('serialización: sin campos internos, indefinidos fuera', () => {
   assert.equal(typeof o.tools.timeoutCounter.max, 'number');
   b.fase(1, 'shopping').fase(1, 'combat');
   assert.equal(typeof JSON.parse(serializa(b.estado)).roundTimeoutTime, 'number');
+});
+
+test('@reinicia_partida: deja el estado de juego limpio (ronda, marcador, jugadores) y conserva la configuración', async () => {
+  const { Banco } = await import('./ayudas.ts');
+  const b = new Banco();
+  b.manda('match_start', 'partida-vieja');
+  b.alta('a1', 0, 'Ana').alta('b1', 1, 'Beto');
+  b.ronda(1, [1, 0]).ronda(2, [2, 0]);
+  b.fase(3, 'shopping');
+  assert.equal(b.estado.roundNumber, 3);
+  assert.equal(b.estado.teams[0].roundsWon, 2);
+  assert.equal(b.estado.teams[0].players.length + b.estado.teams[1].players.length, 2);
+  const nombres = b.estado.teams.map((t) => t.teamName);
+
+  b.evento({ type: '@reinicia_partida', timestamp: b.t });
+  assert.equal(b.ultimo.cambiado, true);
+  assert.equal(b.estado.roundNumber, 0);
+  assert.equal(b.estado.roundPhase, 'LOBBY');
+  assert.deepEqual(b.estado.teams.map((t) => t.roundsWon), [0, 0]);
+  assert.deepEqual(b.estado.teams.map((t) => t.players.length), [0, 0], 'nadie de la partida anterior se queda');
+  assert.equal(b.estado.matchId, '');
+  assert.equal(b.estado.isRunning, false);
+  assert.deepEqual(b.estado.teams.map((t) => t.teamName), nombres, 'los equipos (configuración) siguen');
+
+  // La partida nueva empieza como una cualquiera.
+  b.manda('match_start', 'partida-nueva').alta('a2', 0, 'Ana');
+  assert.equal(b.estado.matchId, 'partida-nueva');
+  assert.equal(b.estado.teams[0].players.length, 1);
+});
+
+test('pausa visual: pone la pausa, se asigna al equipo con un clic y se acaba sola al volver el color; no vale fuera de la compra', () => {
+  let e = partidoNuevo({});
+  const manda = (ev: Record<string, unknown>) => (e = reduce(e, ev as never).estado);
+  const gris = (activa: boolean, t: number) => manda({ type: '@pausa_visual', timestamp: t, activa });
+  const s = () => aSalida(e).timeoutState;
+  gris(true, 1);
+  assert.equal(s().techPause, false, 'en el lobby no se hace caso');
+  e.isRunning = true;
+  e.roundPhase = 'combat';
+  gris(true, 2);
+  assert.equal(s().techPause, false, 'fuera de la compra no se hace caso (los timeouts sólo ocurren en la compra)');
+  e.roundPhase = 'shopping';
+  gris(true, 3);
+  assert.equal(s().techPause, true, 'gris + timer quieto → pausa al instante');
+  // El operador dice de quién fue: pasa a ser ese timeout (con cuenta atrás y descontado).
+  manda({ type: 'left_timeout', timestamp: 4 });
+  assert.equal(s().techPause, false);
+  assert.equal(s().leftTeam, true, 'el timeout del equipo izquierdo corre');
+  assert.equal(aSalida(e).tools.timeoutCounter.left, 1, 'y le quedan 1 de 2');
+  // Vuelve el color: el timeout asignado se acaba (no se queda los 60 s enteros).
+  gris(false, 5000);
+  assert.equal(s().leftTeam, false, 'al volver el color, termina');
+  assert.equal(aSalida(e).tools.timeoutCounter.left, 1, 'y sigue descontado');
+  // Una pausa que puso el operador a mano no la quita el color.
+  manda({ type: 'tech_pause', timestamp: 6000 });
+  assert.equal(s().techPause, true);
+  gris(false, 7000);
+  assert.equal(s().techPause, true, 'la pausa manual manda');
+  manda({ type: 'tech_pause', timestamp: 8000 });
+  // Y una automática no sobrevive a la compra.
+  gris(true, 9000);
+  assert.equal(s().techPause, true);
+  manda({ type: 'round_info', timestamp: 10000, data: { roundPhase: 'combat' } });
+  assert.equal(s().techPause, false, 'la pausa automática no sobrevive a la compra');
 });

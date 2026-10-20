@@ -12,8 +12,14 @@
 import { contadorTiemposMuertos, estadoTiempoMuerto, graciaSuperada } from './tiempos.ts';
 import type { Partido } from './tipos.ts';
 
-export function aSalida(p: Partido) {
+/**
+ * `conClave`: incluir la clave de la sala de cámaras. Sólo para los consumidores AUTENTICADOS (panel, overlays con
+ * token); el estado público, que ve cualquiera que conozca el grupo si no se exige token, NUNCA la lleva.
+ * El resto de `playercamsInfo` (sala, base, parámetros, quién publica) sí viaja: el overlay arma con ello cada cámara.
+ */
+export function aSalida(p: Partido, conClave = false) {
   const t = p.tools;
+  const { clave, ...camarasPublicas } = t.playercamsInfo;
   return {
     matchId: p.matchId,
     matchType: p.matchType,
@@ -44,12 +50,12 @@ export function aSalida(p: Partido) {
       timeoutCancellationGracePeriod: t.timeoutCancellationGracePeriod,
       sponsorInfo: t.sponsorInfo,
       watermarkInfo: t.watermarkInfo,
-      playercamsInfo: t.playercamsInfo,
+      playercamsInfo: conClave && clave !== undefined ? { ...camarasPublicas, clave } : camarasPublicas,
     },
   };
 }
 
 /** La cadena JSON que viaja (todos los eventos llevan un único argumento de texto). */
-export function serializa(p: Partido): string {
-  return JSON.stringify(aSalida(p));
+export function serializa(p: Partido, conClave = false): string {
+  return JSON.stringify(aSalida(p, conClave));
 }

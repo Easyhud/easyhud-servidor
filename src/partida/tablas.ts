@@ -7,6 +7,8 @@
  * "arreglan" por estética. Si Riot añade un agente o un arma, se añade aquí.
  */
 
+import { log } from '../log.ts';
+
 /* ── Agentes ─────────────────────────────────────────────────────────────── */
 
 /** Nombre interno → nombre visible. */
@@ -103,6 +105,9 @@ const ARMAS: Record<string, string> = {
   TX_Hud_Rifles_Ghost: 'Phantom',
   TX_Hud_Assault_AR10A2_S: 'Phantom',
   TX_Hud_Rifles_Volcano: 'Vandal',
+  // El Warden llega con dos nombres de HUD según la versión del juego.
+  TX_Hud_Rifle_BattleRifle: 'Warden',
+  TX_Hud_BattleRifle: 'Warden',
   TX_Hud_Volcano: 'Vandal',
   TX_Hud_Sniper_Bolt: 'Marshal',
   TX_Hud_Sniper_BoltAction_S: 'Marshal',
@@ -165,11 +170,23 @@ const MAPAS: Record<string, string> = {
   HURM_Bowl: 'Kasbah',
   HURM_Helix: 'Drift',
   Rook: 'Corrode',
+  Plummet: 'Summit', // el nombre interno de Summit en el juego
 };
 
-/** Nombre visible del mapa. Un código desconocido da `Corrode` (el más reciente). */
+const MAPAS_AVISADOS = new Set<string>();
+
+/**
+ * Nombre visible del mapa. Un código que no está en la tabla NUNCA se traduce a otro mapa (antes salía `Corrode`,
+ * un dato falso): se devuelve tal cual llegó (o vacío si no hay nada) y se deja una línea en el log, una vez por código.
+ */
 export function nombreMapa(codigo: unknown): string {
-  return typeof codigo === 'string' && Object.hasOwn(MAPAS, codigo) ? MAPAS[codigo] : 'Corrode';
+  if (typeof codigo !== 'string') return '';
+  if (Object.hasOwn(MAPAS, codigo)) return MAPAS[codigo];
+  if (codigo !== '' && MAPAS_AVISADOS.size < 64 && !MAPAS_AVISADOS.has(codigo)) {
+    MAPAS_AVISADOS.add(codigo);
+    log(`mapa desconocido «${codigo.slice(0, 40)}»: se emite tal cual, falta añadirlo a la tabla de mapas`);
+  }
+  return codigo;
 }
 
 /* ── Escudo ──────────────────────────────────────────────────────────────── */

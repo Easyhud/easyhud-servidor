@@ -123,7 +123,15 @@ export interface Herramientas {
   timeoutCancellationGracePeriod: number;
   sponsorInfo: { enabled: boolean; duration: number; sponsors: unknown[]; [clave: string]: unknown };
   watermarkInfo: { brandWatermark: boolean; customTextEnabled: boolean; customText: string; [clave: string]: unknown };
-  playercamsInfo: { enable: boolean; identifier: string; enabledPlayers: string[] };
+  playercamsInfo: {
+    enable: boolean;
+    identifier: string;
+    enabledPlayers: string[];
+    /** Cómo llegar a la web de vídeo; los pone el servidor, no el panel. */
+    base?: string;
+    params?: string;
+    clave?: string;
+  };
 }
 
 export interface Rotulo {
@@ -142,6 +150,10 @@ export interface EstadoTiempos {
   /** Tiempo muerto táctico en curso: de qué equipo de juego y desde cuándo (ms). */
   activo: { equipo: Lado; inicio: number } | null;
   pausaTecnica: boolean;
+  /** La pausa técnica la puso la detección por pantalla (el juego se ve en gris), no el operador: la quita ella misma. */
+  automatica?: boolean;
+  /** La pantalla se ve en gris con el timer quieto AHORA (la detección sigue viva): cuando vuelve el color, lo que esté en marcha se acaba. */
+  visual?: boolean;
   /** Lo que viaja como `timeoutState.timeRemaining` (segundos). */
   segundosRestantes: number;
   /** Si ya se concedió el extra de prórroga en este mapa. */
@@ -185,6 +197,19 @@ export interface Interno {
    * `game_end`, observador que retoma un grupo huérfano).
    */
   ultimaJugada?: number;
+  /**
+   * La última ronda apuntada en el historial y quién la ganó, mientras todavía pueda corregirse su motivo (un
+   * `spike_defused`/`spike_detonated` o el `end` pueden llegar unos instantes DESPUÉS del `score`). Se cierra al
+   * empezar la compra siguiente.
+   */
+  rondaAbierta?: { ronda: number; ganador: Lado };
+  /** La ronda (en juego) de la última compra procesada: una compra con número mayor es ronda nueva aunque falten fases. */
+  ultimaCompra?: number;
+  /**
+   * Evidencia de «desconectado» por jugador (puuid): desde cuándo y cuántos marcadores seguidos lo dan muerto EN la
+   * compra. Un marcador rezagado suelto no basta (ver `actualizaMarcador`).
+   */
+  muertoEnCompra: Record<string, { desde: number; n: number }>;
 }
 
 export interface Partido {
@@ -226,7 +251,20 @@ export interface Paquete {
 export type EventoInterno =
   | { type: '@reloj'; timestamp: number }
   | { type: '@configura'; timestamp: number; parche: Record<string, unknown> }
-  | { type: '@jugador_desconectado'; timestamp: number; playerId: string };
+  | { type: '@jugador_desconectado'; timestamp: number; playerId: string }
+  /** El operador pide dejar el estado de JUEGO limpio (ronda, marcador, jugadores): empieza otra partida. */
+  | { type: '@reinicia_partida'; timestamp: number }
+  /** Un jugador sigue conectado mandando sus datos propios, pero su partida se recreó: se le devuelve la marca de «manda vida». */
+  | { type: '@aux_disponible'; timestamp: number; playerId: string }
+  /** La detección por pantalla del observador: el juego se ve en gris (timeout o pausa) o ha vuelto el color. */
+  | { type: '@pausa_visual'; timestamp: number; activa: boolean }
+  /** Quién está publicando cámara ahora mismo (lo calcula `Central`, no el panel). */
+  | {
+      type: '@camaras';
+      timestamp: number;
+      publicando: string[];
+      conexion?: { base: string; params: string; clave: string };
+    };
 
 export type Evento = Paquete | EventoInterno;
 
@@ -245,6 +283,8 @@ export interface MemoriaGrupo {
   /** Lo que el panel configuró de los tiempos muertos: vale para los mapas siguientes. */
   tiempos?: { max?: number; duracion?: number };
   equipos: [EquipoGuardado | null, EquipoGuardado | null];
+  /** Cámaras: activadas y sala. Sobrevive a los mapas y a configurarse antes del partido. */
+  camaras?: { enable?: boolean; identifier?: string };
 }
 
 /* ── El logon del observador (lo que hace falta para crear el partido) ──── */

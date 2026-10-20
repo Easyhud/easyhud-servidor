@@ -36,6 +36,7 @@ before(async () => {
     extraProrroga: 1,
     minutosInactividad: 30,
     puertos: { ingesta: 0, salida: 0, extras: 0 },
+    camaras: { base: 'https://vdo.ninja', params: '' },
   };
   servidor = await arranca(config);
 });
@@ -219,20 +220,48 @@ test('reproducción de una grabación real: el overlay recibe match_data', async
   // "Call players": entra por grupo.
   const llamado = conecta(servidor.puertos.ingesta);
   const aceptado = espera(llamado, 'aux_logon_ack');
+  const primeraConfig = espera(llamado, 'cam_config');
   llamado.emit(
     'aux_logon',
     JSON.stringify({ type: 'aux_authenticate', clientVersion: '0.3.3', name: 'JugadorDos', matchId: '', groupCode: grupo, playerId: '00000000-0000-4000-8000-000000000001' }),
   );
   assert.deepEqual(await aceptado, { type: 'aux_authenticate', value: true });
 
+  // Cámaras: el jugador recibe la configuración al entrar y cuando el operador la cambia.
+  const c0 = await primeraConfig;
+  assert.equal(c0.enable, false);
+  assert.equal(c0.base, 'https://vdo.ninja');
+  assert.match(c0.clave, /^[A-Za-z0-9_-]{16}$/);
+  const nuevaConfig = espera(llamado, 'cam_config', (c) => c.enable === true);
+  mando.emit('configura', JSON.stringify({ playercamsInfo: { enable: true, identifier: 'SALA9' } }));
+  const c1 = await nuevaConfig;
+  assert.equal(c1.room, 'SALA9');
+  assert.equal(c1.clave, c0.clave, 'la clave es estable para el grupo');
+
   // Un jugador no puede escribir en otro grupo ni mandar datos de observador.
   llamado.emit('obs_data', JSON.stringify({ obsName: 'x', groupCode: grupo, type: 'switch_kda_credits', data: true }));
-  // Pero sí sus datos propios (y el matchId del paquete no importa).
+  // Pero sí sus datos propios (y el matchId del paquete no importa). Con el playerId de OTRO, el paquete se descarta (S3).
+  llamado.emit('aux_data', JSON.stringify({ playerId: 'otro-cualquiera', matchId: 'da-igual', type: 'aux_health', data: 7 }));
   const conVida = espera(overlay, 'match_data', (x) => x.teams[1].players[0].health === 42);
-  llamado.emit('aux_data', JSON.stringify({ playerId: 'otro-cualquiera', matchId: 'da-igual', type: 'aux_health', data: 42 }));
+  llamado.emit('aux_data', JSON.stringify({ playerId: '00000000-0000-4000-8000-000000000001', matchId: 'da-igual', type: 'aux_health', data: 42 }));
   const v = await conVida;
   assert.equal(v.showAliveKDA, false, 'el obs_data del jugador se descartó');
   assert.equal(v.teams[1].players[0].auxiliaryAvailable.health, true);
+
+  // Cámara: el jugador anuncia que publica; un nombre inválido se ignora.
+  const conCamara = espera(overlay, 'match_data', (x) => x.tools.playercamsInfo.enabledPlayers.length === 1);
+  llamado.emit('aux_data', JSON.stringify({ playerId: 'x', matchId: '', type: 'aux_cam', data: { publishing: true, id: 'JugadorDos#EUW' } }));
+  assert.deepEqual((await conCamara).tools.playercamsInfo.enabledPlayers, ['JugadorDos#EUW']);
+  llamado.emit('aux_data', JSON.stringify({ playerId: 'x', matchId: '', type: 'aux_cam', data: { publishing: true, id: 'sin-tag' } }));
+  const sinCamara = espera(overlay, 'match_data', (x) => x.tools.playercamsInfo.enabledPlayers.length === 0);
+  await sinCamara;
+
+  // Y al volver a publicar y desconectarse, sale de la lista.
+  llamado.emit('aux_data', JSON.stringify({ playerId: 'x', matchId: '', type: 'aux_cam', data: { publishing: true, id: 'JugadorDos#EUW' } }));
+  await espera(overlay, 'match_data', (x) => x.tools.playercamsInfo.enabledPlayers.length === 1);
+  const sinConexion = espera(overlay, 'match_data', (x) => x.tools.playercamsInfo.enabledPlayers.length === 0);
+  llamado.close();
+  await sinConexion;
 
   // Fin de mapa: el estado final SÍ llega, y después se echa al observador.
   const estadoFinal = espera(overlay, 'match_data', (x) => x.roundPhase === 'game_end');
@@ -285,4 +314,281 @@ test('presencia y "Call players"', async () => {
   obs.emit('obs_lobby', JSON.stringify({ obsName: 'o', groupCode: grupo, sala: { equipoUno: [{ puuid: 'puuid-1' }, { puuid: 'puuid-2' }], equipoDos: [] } }));
   const s = await sala;
   assert.deepEqual(s.conectados, ['puuid-1']);
+});
+
+test('"Call players" insiste hasta que el jugador conecta y el panel ve quién tiene el programa', async () => {
+  const grupo = 'INSISTE';
+  const token = firmaToken(grupo, 1, 'c', SECRETO);
+  const { socket: obs, ack } = await intentaObservador(grupo, token);
+  assert.equal(ack.value, true);
+
+  // El jugador todavía no ha abierto el programa: nadie a quien avisar.
+  const acuse = espera(obs, 'llamar_jugadores_ack');
+  obs.emit('llamar_jugadores', JSON.stringify({ puuids: ['p-tarde', 'p-nunca'] }));
+  assert.deepEqual(await acuse, { avisados: [] });
+
+  // Lo abre después: su primer latido ya recibe la llamada que quedó pendiente.
+  const j = conecta(servidor.puertos.ingesta);
+  await new Promise<void>((r) => j.once('connect', () => r()));
+  const llamada = espera(j, 'te_llaman');
+  j.emit('cliente_presente', JSON.stringify({ puuid: 'p-tarde' }));
+  assert.deepEqual(await llamada, { groupCode: grupo });
+
+  // El panel pregunta por los dos: sólo uno tiene el programa abierto.
+  const mando = conecta(servidor.puertos.salida, '/operador');
+  await new Promise<void>((r) => mando.once('connect', () => r()));
+  const listo = espera(mando, 'operador_listo');
+  mando.emit('operador_logon', JSON.stringify({ groupCode: grupo, token }));
+  await listo;
+  const respuesta = espera(mando, 'presencia');
+  mando.emit('presencia_consulta', JSON.stringify({ puuids: ['p-tarde', 'p-nunca'] }));
+  const r = (await respuesta) as { activos: string[]; estado: Record<string, { app: boolean }> };
+  assert.deepEqual(r.activos, ['p-tarde']);
+  assert.deepEqual([r.estado['p-tarde'].app, r.estado['p-nunca'].app], [true, false]);
+
+  // Si el aviso se pierde, el siguiente latido lo repite…
+  const repetida = espera(j, 'te_llaman');
+  j.emit('cliente_presente', JSON.stringify({ puuid: 'p-tarde' }));
+  assert.deepEqual(await repetida, { groupCode: grupo });
+
+  // …pero en cuanto entra al grupo deja de llamarse.
+  const entra = espera(j, 'aux_logon_ack');
+  j.emit('aux_logon', JSON.stringify({ type: 'aux_authenticate', clientVersion: '0.3.3', name: 'Tarde', matchId: '', groupCode: grupo, playerId: 'p-tarde' }));
+  assert.equal((await entra).value, true);
+  let volvieron = false;
+  j.on('te_llaman', () => (volvieron = true));
+  j.emit('cliente_presente', JSON.stringify({ puuid: 'p-tarde' }));
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(volvieron, false, 'ya está dentro: no se le vuelve a llamar');
+
+  // Una lista vacía cancela la llamada a quien falte.
+  obs.emit('llamar_jugadores', JSON.stringify({ puuids: [] }));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(servidor.central.grupoPendiente('p-nunca'), undefined);
+});
+
+test('"Call players" lleva el código de la sala de Riot cuando ya existe', async () => {
+  const grupo = 'CONCODIGO';
+  const token = firmaToken(grupo, 1, 'c', SECRETO);
+  const { socket: obs, ack } = await intentaObservador(grupo, token);
+  assert.equal(ack.value, true);
+
+  const jugador = conecta(servidor.puertos.ingesta);
+  await new Promise<void>((r) => jugador.once('connect', () => r()));
+  jugador.emit('cliente_presente', JSON.stringify({ puuid: 'p-codigo' }));
+  await new Promise((r) => setTimeout(r, 100));
+
+  // Sin sala todavía: sólo el grupo.
+  const sinSala = espera(jugador, 'te_llaman');
+  obs.emit('llamar_jugadores', JSON.stringify({ puuids: ['p-codigo'] }));
+  assert.deepEqual(await sinSala, { groupCode: grupo });
+
+  // El observador crea la sala (el lector manda su código): la siguiente llamada lo lleva.
+  obs.emit('obs_lobby', JSON.stringify({ obsName: 'o', groupCode: grupo, sala: { codigo: 'ABC123', equipoUno: [], equipoDos: [] } }));
+  await new Promise((r) => setTimeout(r, 100));
+  const conSala = espera(jugador, 'te_llaman');
+  obs.emit('llamar_jugadores', JSON.stringify({ puuids: ['p-codigo'] }));
+  assert.deepEqual(await conSala, { groupCode: grupo, inviteCode: 'ABC123' });
+
+  // Y el reintento por latido también.
+  const porLatido = espera(jugador, 'te_llaman');
+  jugador.emit('cliente_presente', JSON.stringify({ puuid: 'p-codigo' }));
+  assert.deepEqual(await porLatido, { groupCode: grupo, inviteCode: 'ABC123' });
+});
+
+test('"Call players" insiste con el código vigente hasta que el jugador está DENTRO de la sala de Riot', async () => {
+  const grupo = 'REINSISTE';
+  const token = firmaToken(grupo, 1, 'c', SECRETO);
+  const { socket: obs, ack } = await intentaObservador(grupo, token);
+  assert.equal(ack.value, true);
+
+  // El jugador tiene el programa abierto y ya entró al grupo (conectado al servidor).
+  const jugador = conecta(servidor.puertos.ingesta);
+  await new Promise<void>((r) => jugador.once('connect', () => r()));
+  jugador.emit('cliente_presente', JSON.stringify({ puuid: 'p-sala' }));
+  const entra = espera(jugador, 'aux_logon_ack');
+  jugador.emit('aux_logon', JSON.stringify({ type: 'aux_authenticate', clientVersion: '0.3.3', name: 'Sala', matchId: '', groupCode: grupo, playerId: 'p-sala' }));
+  assert.equal((await entra).value, true);
+
+  // Hay una sala de Riot y él NO está en ella: se le llama.
+  obs.emit('obs_lobby', JSON.stringify({ obsName: 'o', groupCode: grupo, sala: { codigo: 'VIEJA1', equipoUno: [], equipoDos: [] } }));
+  await new Promise((r) => setTimeout(r, 100));
+  const acuse = espera(obs, 'llamar_jugadores_ack');
+  obs.emit('llamar_jugadores', JSON.stringify({ puuids: ['p-sala'] }));
+  await acuse;
+
+  // El operador cierra esa sala y crea otra: el aviso siguiente lleva el código NUEVO.
+  obs.emit('obs_lobby', JSON.stringify({ obsName: 'o', groupCode: grupo, sala: { codigo: 'NUEVA2', equipoUno: [], equipoDos: [] } }));
+  await new Promise((r) => setTimeout(r, 100));
+  const otra = espera(jugador, 'te_llaman', (d) => d.inviteCode === 'NUEVA2');
+  servidor.central.insiste();
+  assert.deepEqual(await otra, { groupCode: grupo, inviteCode: 'NUEVA2' });
+
+  // En cuanto aparece en la lista de la sala, deja de llamársele.
+  obs.emit('obs_lobby', JSON.stringify({ obsName: 'o', groupCode: grupo, sala: { codigo: 'NUEVA2', equipoUno: [{ puuid: 'p-sala' }], equipoDos: [] } }));
+  await new Promise((r) => setTimeout(r, 100));
+  let volvio = false;
+  jugador.on('te_llaman', () => (volvio = true));
+  servidor.central.insiste();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(volvio, false, 'ya está dentro de la sala: no se le insiste');
+});
+
+test('diagnóstico por la red: el exe late con su estado, recibe el acuse y el panel ve el veredicto y los paquetes', async () => {
+  const grupo = 'DIAGRED';
+  const token = firmaToken(grupo, 1, 'c', SECRETO);
+  const { socket: obs, ack } = await intentaObservador(grupo, token);
+  assert.equal(ack.value, true);
+
+  const j = conecta(servidor.puertos.ingesta);
+  await new Promise<void>((r) => j.once('connect', () => r()));
+  const estado = {
+    version: '0.3.5', gep: 'listo', gepVersion: '315.0.2', juegoAbierto: true, juegoDetectado: true, eventosHace: 1500,
+    datos: 'cerrada', red: '', riot: 'signed in', camara: { permitida: false, publicando: false, error: '' },
+    enviados: {}, errores: [],
+  };
+  // Con acuse: el servidor contesta al latido.
+  const acuse = await new Promise<{ ok: boolean; servidor: string }>((resolve) =>
+    j.emit('cliente_presente', JSON.stringify({ puuid: 'p-diag', estado }), resolve),
+  );
+  assert.equal(acuse.ok, true);
+  assert.ok(acuse.servidor.length > 0);
+
+  // Entra al grupo y manda datos: el servidor cuenta los paquetes por tipo.
+  const entra = espera(j, 'aux_logon_ack');
+  j.emit('aux_logon', JSON.stringify({ type: 'aux_authenticate', clientVersion: '0.3.3', name: 'Diag', matchId: '', groupCode: grupo, playerId: 'p-diag' }));
+  assert.equal((await entra).value, true);
+  j.emit('aux_data', JSON.stringify({ playerId: 'p-diag', groupCode: grupo, type: 'aux_health', data: 100 }));
+  j.emit('aux_data', JSON.stringify({ playerId: 'p-diag', groupCode: grupo, type: 'aux_health', data: 90 }));
+  // El observador manda un marcador suyo.
+  obs.emit('obs_data', JSON.stringify({ obsName: 'o', groupCode: grupo, type: 'scoreboard', data: { name: 'Diag', tagline: 'T', playerId: 'p-diag', startTeam: 0, money: 800 } }));
+  await new Promise((r) => setTimeout(r, 200));
+
+  const mando = conecta(servidor.puertos.salida, '/operador');
+  await new Promise<void>((r) => mando.once('connect', () => r()));
+  const listo = espera(mando, 'operador_listo');
+  mando.emit('operador_logon', JSON.stringify({ groupCode: grupo, token }));
+  await listo;
+  const respuesta = espera(mando, 'presencia');
+  mando.emit('presencia_consulta', JSON.stringify({ puuids: ['p-diag', 'p-vacio'] }));
+  const r = (await respuesta) as {
+    estado: Record<string, { veredicto: string; dentro: boolean; diag: { version: string; haceMs: number } | null; paquetes: Record<string, { n: number }>; marcador: { n: number } | null }>;
+  };
+  assert.equal(r.estado['p-diag'].veredicto, 'ok');
+  assert.equal(r.estado['p-diag'].dentro, true);
+  assert.equal(r.estado['p-diag'].diag?.version, '0.3.5');
+  assert.equal(r.estado['p-diag'].paquetes.aux_health.n, 2);
+  assert.equal(r.estado['p-diag'].marcador?.n, 1);
+  assert.equal(r.estado['p-vacio'].veredicto, 'sin-programa');
+});
+
+test('sala nula: el observador dice que ya no hay sala y el panel deja de ver la vieja', async () => {
+  const grupo = 'SALANULA';
+  const token = firmaToken(grupo, 1, 'c', SECRETO);
+  const { socket: obs, ack } = await intentaObservador(grupo, token);
+  assert.equal(ack.value, true);
+
+  obs.emit('obs_lobby', JSON.stringify({ obsName: 'o', groupCode: grupo, sala: { codigo: 'VIEJA9', equipoUno: [{ puuid: 'p1' }], equipoDos: [] } }));
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(servidor.central.codigoSala(grupo), 'VIEJA9');
+
+  // El panel escucha las salas del grupo (como los overlays: por el logon de salida).
+  const mirada = conecta(servidor.puertos.salida);
+  await new Promise<void>((r) => mirada.once('connect', () => r()));
+  const dentro = espera(mirada, 'logon_success');
+  mirada.emit('logon', JSON.stringify({ groupCode: grupo, token }));
+  await dentro;
+  const vacia = espera(mirada, 'sala', (d) => d.codigo === '');
+
+  obs.emit('obs_lobby', JSON.stringify({ obsName: 'o', groupCode: grupo, sala: null }));
+  const s = (await vacia) as { codigo: string; equipoUno: unknown[]; conectados: unknown[] };
+  assert.equal(s.codigo, '');
+  assert.deepEqual(s.equipoUno, []);
+  assert.equal(servidor.central.codigoSala(grupo), '', 'el servidor ya no recuerda la sala vieja');
+});
+
+test('caja negra: el operador pide el informe, el programa lo manda, se guarda en disco y el panel lo ve', async () => {
+  const grupo = 'CAJANEGRA';
+  const token = firmaToken(grupo, 1, 'c', SECRETO);
+  const { socket: obs, ack } = await intentaObservador(grupo, token);
+  assert.equal(ack.value, true);
+
+  const puuid = '11111111-2222-3333-4444-555555555555';
+  const j = conecta(servidor.puertos.ingesta);
+  await new Promise<void>((r) => j.once('connect', () => r()));
+  const acuse = await new Promise<{ ok: boolean }>((resolve) => j.emit('cliente_presente', JSON.stringify({ puuid }), resolve));
+  assert.equal(acuse.ok, true);
+
+  // El operador pide el informe de ese jugador (y de otro que no tiene el programa abierto).
+  const mando = conecta(servidor.puertos.salida, '/operador');
+  await new Promise<void>((r) => mando.once('connect', () => r()));
+  const listo = espera(mando, 'operador_listo');
+  mando.emit('operador_logon', JSON.stringify({ groupCode: grupo, token }));
+  await listo;
+  const piden = espera(j, 'pide_informe');
+  const respuesta = espera(mando, 'informe_pedido', (d) => d.puuid === puuid);
+  mando.emit('orden', JSON.stringify({ tipo: 'pideInforme', datos: { puuid } }));
+  await piden;
+  assert.equal(((await respuesta) as { ok: boolean }).ok, true);
+  const ausente = espera(mando, 'informe_pedido', (d) => d.puuid === 'ffffffff-0000-0000-0000-000000000000');
+  mando.emit('orden', JSON.stringify({ tipo: 'pideInforme', datos: { puuid: 'ffffffff-0000-0000-0000-000000000000' } }));
+  assert.equal(((await ausente) as { ok: boolean }).ok, false, 'sin programa abierto no llega');
+
+  // El programa manda su informe: se guarda y el panel lo ve.
+  const informe = { formato: 1, estado: { gep: 'listo' }, conclusiones: [{ id: 'overwolf-no-entrega', certeza: 'confirmada', texto: 'Overwolf no genera la vida en este PC.' }, { id: 'malo', certeza: 'inventada', texto: 'x' }] };
+  const guardado = await new Promise<{ ok: boolean }>((resolve) =>
+    j.emit('informe_cliente', JSON.stringify({ puuid, informe: JSON.stringify(informe) }), resolve),
+  );
+  assert.equal(guardado.ok, true);
+  const { readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const enDisco = JSON.parse(readFileSync(join(carpeta, 'informes', `${puuid}.json`), 'utf8'));
+  assert.equal(enDisco.formato, 1);
+  assert.ok((servidor.central.estadoJugadores(grupo, [puuid])[puuid].informe?.bytes ?? 0) > 0);
+  assert.deepEqual(servidor.central.estadoJugadores(grupo, [puuid])[puuid].informe?.conclusiones, [{ id: 'overwolf-no-entrega', certeza: 'confirmada', texto: 'Overwolf no genera la vida en este PC.' }], 'sólo las conclusiones válidas llegan al panel');
+
+  // Un informe que no es suyo o demasiado grande se rechaza.
+  const grande = await new Promise<{ ok: boolean }>((resolve) =>
+    j.emit('informe_cliente', JSON.stringify({ puuid, informe: 'x'.repeat(700 * 1024) }), resolve),
+  );
+  assert.equal(grande.ok, false);
+  const raro = await new Promise<{ ok: boolean }>((resolve) =>
+    j.emit('informe_cliente', JSON.stringify({ puuid: '../../etc/passwd', informe: '{}' }), resolve),
+  );
+  assert.equal(raro.ok, false, 'un puuid con rutas raras no escribe nada');
+  obs.close();
+});
+
+test('orden remota a un jugador: sólo «reconecta» está permitida, y sólo llega a quien tiene el programa abierto', async () => {
+  const grupo = 'ORDENREMOTA';
+  const token = firmaToken(grupo, 1, 'c', SECRETO);
+  const { socket: obs, ack } = await intentaObservador(grupo, token);
+  assert.equal(ack.value, true);
+
+  const puuid = '99999999-aaaa-bbbb-cccc-dddddddddddd';
+  const j = conecta(servidor.puertos.ingesta);
+  await new Promise<void>((r) => j.once('connect', () => r()));
+  await new Promise<{ ok: boolean }>((resolve) => j.emit('cliente_presente', JSON.stringify({ puuid }), resolve));
+
+  const mando = conecta(servidor.puertos.salida, '/operador');
+  await new Promise<void>((r) => mando.once('connect', () => r()));
+  const listo = espera(mando, 'operador_listo');
+  mando.emit('operador_logon', JSON.stringify({ groupCode: grupo, token }));
+  await listo;
+
+  const llega = espera(j, 'orden_remota');
+  const resp = espera(mando, 'orden_jugador', (d) => d.accion === 'reconecta');
+  mando.emit('orden', JSON.stringify({ tipo: 'ordenJugador', datos: { puuid, accion: 'reconecta' } }));
+  assert.deepEqual(await llega, { accion: 'reconecta' });
+  assert.equal(((await resp) as { ok: boolean }).ok, true);
+
+  // Una acción que no está en la lista no se envía.
+  let recibida = false;
+  j.on('orden_remota', () => (recibida = true));
+  const mala = espera(mando, 'orden_jugador', (d) => d.accion === 'borra-todo');
+  mando.emit('orden', JSON.stringify({ tipo: 'ordenJugador', datos: { puuid, accion: 'borra-todo' } }));
+  assert.equal(((await mala) as { ok: boolean }).ok, false);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(recibida, false, 'una orden fuera de la lista no llega al programa');
+  obs.close();
 });

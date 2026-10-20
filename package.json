@@ -13,7 +13,8 @@
     "token": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/herramientas/token.ts",
     "reproduce": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/herramientas/reproductor.ts",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test \"test/**/*.test.ts\""
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test \"test/**/*.test.ts\"",
+    "prueba:camaras": "node --experimental-strip-types --disable-warning=ExperimentalWarning src/herramientas/prueba-camaras.ts"
   },
   "dependencies": {
     "socket.io": "4.8.4"

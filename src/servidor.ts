@@ -90,7 +90,7 @@ export async function arranca(config: Config): Promise<Servidor> {
   const ioIngesta = new Server(httpIngesta, OPCIONES_SOCKET);
   const ingesta = montaIngesta(ioIngesta, central, config);
 
-  central.conecta({ ...salida, expulsaGrupo: ingesta.expulsaGrupo });
+  central.conecta({ ...salida, expulsaGrupo: ingesta.expulsaGrupo, camaras: ingesta.camaras, llama: ingesta.llama, pideInforme: ingesta.pideInforme, ordenJugador: ingesta.ordenJugador });
 
   const httpExtras = creaServidorHttp(config, rutasExtras(central));
 

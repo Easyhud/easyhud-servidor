@@ -226,6 +226,8 @@ export function creaPartido(d: DatosCreacion, memoria: MemoriaGrupo | undefined,
   // Lo configurado en el panel para este grupo manda sobre los fijos del logon.
   if (memoria?.tiempos?.max !== undefined) tools.timeoutMax = memoria.tiempos.max;
   if (memoria?.tiempos?.duracion !== undefined) tools.timeoutDuration = memoria.tiempos.duracion;
+  if (memoria?.camaras?.enable !== undefined) tools.playercamsInfo.enable = memoria.camaras.enable;
+  if (memoria?.camaras?.identifier !== undefined) tools.playercamsInfo.identifier = memoria.camaras.identifier;
   const max = tools.timeoutMax;
 
   const p: Partido = {
@@ -260,6 +262,7 @@ export function creaPartido(d: DatosCreacion, memoria: MemoriaGrupo | undefined,
       hayRoster: false,
       registrados: [[], []],
       rosterVisto: {},
+      muertoEnCompra: {},
     },
   };
 

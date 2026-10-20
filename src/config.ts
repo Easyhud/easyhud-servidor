@@ -31,6 +31,12 @@ export interface Config {
   /** Minutos sin envíos tras los que un partido se da por abandonado. */
   minutosInactividad: number;
   puertos: { ingesta: number; salida: number; extras: number };
+  /**
+   * Dónde está la web de vídeo de las cámaras y los parámetros fijos que hay que
+   * añadir a sus URLs (señalización y TURN propios). Viajan al overlay y a los
+   * jugadores en `playercamsInfo`, así cambiar de proveedor es cambiar esto.
+   */
+  camaras: { base: string; params: string };
 }
 
 export class ErrorDeConfiguracion extends Error {}
@@ -83,5 +89,9 @@ export function leeConfig(env: NodeJS.ProcessEnv = process.env): Config {
     minutosInactividad: entero(env.MINUTOS_INACTIVIDAD, 30, 'MINUTOS_INACTIVIDAD'),
     // Fijos a propósito: el cliente deriva el 5200 sustituyendo ":5100" en su URL.
     puertos: { ingesta: 5100, salida: 5200, extras: 5101 },
+    camaras: {
+      base: (env.CAMARAS_BASE_URL || 'https://vdo.ninja').replace(/\/+$/, ''),
+      params: (env.CAMARAS_PARAMS || '').replace(/^[?&]+/, ''),
+    },
   };
 }

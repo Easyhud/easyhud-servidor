@@ -18,6 +18,16 @@ import { log } from './log.ts';
 import { emite, leeCarga, respondeYCorta } from './mensajes.ts';
 import { type Veredicto, validaToken } from './token.ts';
 
+/**
+ * La sala de socket.io de los consumidores AUTENTICADOS de un grupo (los que reciben la clave de las cámaras en
+ * `match_data`). El prefijo lleva un carácter de control que un `groupCode` no puede traer (se rechaza en el logon):
+ * así nadie entra en ella pidiendo un grupo con un nombre parecido.
+ */
+const salaAutenticada = (grupo: string): string => `\u0001aut|${grupo}`;
+
+/** Lo que el operador puede mandarle al programa de un jugador. */
+const ACCIONES_REMOTAS = new Set(['reconecta']);
+
 /** Orden del panel → tipo de paquete equivalente. */
 const ORDENES: Record<string, string> = {
   pausaTecnica: 'tech_pause',
@@ -30,7 +40,7 @@ const ORDENES: Record<string, string> = {
   rotulo: 'toast',
 };
 
-export function montaSalida(io: Server, central: Central, config: Config): Omit<Difusion, 'expulsaGrupo'> {
+export function montaSalida(io: Server, central: Central, config: Config): Omit<Difusion, 'expulsaGrupo' | 'camaras' | 'llama' | 'pideInforme' | 'ordenJugador'> {
   /** Puerta de los overlays: sólo exige token si REQUIRE_OVERLAY_TOKEN=true. */
   const validaMirada = (token: unknown, grupo: string): Veredicto => {
     if (config.sinAutenticacion) return { valido: true, motivo: 'sin autenticación (desarrollo)' };
@@ -57,13 +67,17 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
       }
       hecho = true;
       const grupo = typeof d.groupCode === 'string' ? d.groupCode : '';
-      const v = grupo === '' ? { valido: false, motivo: 'sin groupCode' } : validaMirada(d.token, grupo);
+      const v = grupo === '' || grupo.includes('\u0001') ? { valido: false, motivo: 'sin groupCode' } : validaMirada(d.token, grupo);
       if (!v.valido) {
         log(`logon de overlay denegado (${grupo}): ${v.motivo}`);
         respondeYCorta(socket, 'logon_denied', { reason: v.motivo });
         return;
       }
       void socket.join(grupo);
+      // ¿Viene con un token válido de este grupo (o el servidor está en modo desarrollo)? Entonces recibe también la clave de las cámaras.
+      if (config.sinAutenticacion || (config.secretoToken !== undefined && validaToken(d.token, grupo, config.secretoToken).valido)) {
+        void socket.join(salaAutenticada(grupo));
+      }
       emite(socket, 'logon_success', { groupCode: grupo, msg: `Logon succeeded for group code ${grupo}` });
       central.enviaAhora(grupo);
       central.difundeSala(grupo);
@@ -96,6 +110,41 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
       const d = leeCarga(msg);
       if (!d) return;
       const tipo = d.tipo;
+      // Órdenes remotas a un jugador (sólo las de la lista: nada que cambie su PC más allá de reconectar).
+      if (tipo === 'ordenJugador') {
+        const datos = (d.datos ?? {}) as { puuid?: unknown; accion?: unknown };
+        const objetivo = typeof datos.puuid === 'string' ? datos.puuid : '';
+        const accion = typeof datos.accion === 'string' ? datos.accion : '';
+        const permitido = ACCIONES_REMOTAS.has(accion) && /^[0-9a-f-]{8,64}$/i.test(objetivo);
+        const llego = permitido && central.ordenJugador(objetivo, accion);
+        log(`orden «${accion}» a ${objetivo.slice(0, 8)}…: ${!permitido ? 'no permitida' : llego ? 'enviada' : 'sin programa abierto'}`);
+        emite(socket, 'orden_jugador', { puuid: objetivo, accion, ok: llego });
+        return;
+      }
+      // Pedirle a un jugador su informe completo (caja negra): no es un paquete de juego.
+      if (tipo === 'pideInforme') {
+        const objetivo = typeof (d.datos as { puuid?: unknown } | null)?.puuid === 'string' ? (d.datos as { puuid: string }).puuid : '';
+        const llego = objetivo !== '' && central.pideInforme(objetivo);
+        log(`informe pedido a ${objetivo.slice(0, 8)}…: ${llego ? 'enviado' : 'sin programa abierto'}`);
+        emite(socket, 'informe_pedido', { puuid: objetivo, ok: llego });
+        return;
+      }
+      // La detección por pantalla del observador (el juego se ve en gris): pausa automática.
+      if (tipo === 'pausaVisual') {
+        const activa = (d.datos as { activa?: unknown } | undefined)?.activa === true;
+        if (central.partido(grupo)) central.procesa(grupo, { type: '@pausa_visual', timestamp: Date.now(), activa });
+        return;
+      }
+      // Estado de juego limpio: no es un paquete de juego, lo entiende el reductor directamente.
+      if (tipo === 'reiniciaPartida') {
+        if (!central.partido(grupo)) {
+          emite(socket, 'operador_error', { reason: 'sin partido que reiniciar' });
+          return;
+        }
+        log(`estado de juego reiniciado por el operador en ${grupo}`);
+        central.procesa(grupo, { type: '@reinicia_partida', timestamp: Date.now() });
+        return;
+      }
       const equivalente = typeof tipo === 'string' && Object.hasOwn(ORDENES, tipo) ? ORDENES[tipo] : undefined;
       if (!equivalente || !central.partido(grupo)) {
         emite(socket, 'operador_error', { reason: `orden no aplicada: ${String(tipo)}` });
@@ -112,6 +161,14 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
       central.procesa(grupo, paquete);
     });
 
+    // El panel pregunta quién tiene el programa abierto (fichas de equipo y "Call players").
+    socket.on('presencia_consulta', (msg) => {
+      if (grupo === null) return;
+      const d = leeCarga(msg);
+      const lista = Array.isArray(d?.puuids) ? d.puuids.filter((p): p is string => typeof p === 'string').slice(0, 200) : [];
+      emite(socket, 'presencia', { activos: central.activos(grupo, lista), estado: central.estadoJugadores(grupo, lista) });
+    });
+
     socket.on('configura', (msg) => {
       if (grupo === null) return;
       const parche = leeCarga(msg);
@@ -123,8 +180,14 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
   });
 
   return {
-    estado(grupo, json) {
-      io.to(grupo).emit('match_data', json);
+    estado(grupo, json, jsonAutenticado) {
+      if (jsonAutenticado === undefined) {
+        io.to(grupo).emit('match_data', json);
+        return;
+      }
+      // Los autenticados reciben su versión (con la clave de cámaras) y NO la pública: así nadie recibe dos.
+      io.to(grupo).except(salaAutenticada(grupo)).emit('match_data', json);
+      io.to(salaAutenticada(grupo)).emit('match_data', jsonAutenticado);
     },
     sala(grupo, carga) {
       io.to(grupo).emit('sala', JSON.stringify(carga));

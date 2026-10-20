@@ -15,6 +15,8 @@ import type { Equipo, Jugador, Partido } from './tipos.ts';
 const MAX_JUGADORES = 5;
 const SPIKE_MS = 45_000;
 const PREMIO_PLANTAR = 300;
+/** Tiempo mínimo (de partida) muerto en la compra para darlo por desconectado. */
+const DESCONEXION_MS = 3_000;
 
 const esNumero = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const num = (v: unknown, defecto = 0): number => (esNumero(v) ? v : defecto);
@@ -92,10 +94,11 @@ function cambiaAgente(j: Jugador, agente: string): void {
 
 /**
  * La actualización común a todos los marcadores (observador, jugador,
- * compañeros). `d` es el dato del marcador tal como llega; `fase`, la fase de
- * la ronda en curso.
+ * compañeros). `d` es el dato del marcador tal como llega; `ahora`, la hora
+ * del paquete (para la evidencia de desconexión).
  */
-function actualizaMarcador(j: Jugador, d: Record<string, unknown>, fase: string): void {
+function actualizaMarcador(p: Partido, j: Jugador, d: Record<string, unknown>, ahora: number): void {
+  const fase = p.roundPhase;
   const kills = num(d.kills, j.kills);
   const deaths = num(d.deaths, j.deaths);
   const assists = num(d.assists, j.assists);
@@ -114,7 +117,8 @@ function actualizaMarcador(j: Jugador, d: Record<string, unknown>, fase: string)
   j.assists = assists;
   j.currUltPoints = ult;
   j.maxUltPoints = ultMax;
-  j.ultReady = ult >= ultMax;
+  // Sin los dos datos (o con un máximo de 0) no hay ulti lista: antes `0 >= 0` la daba por cargada.
+  j.ultReady = ult >= ultMax && ultMax > 0;
 
   // Gasto de la ronda (se mantiene la cuenta heredada: puede bajar si entra dinero).
   if (esNumero(d.money)) {
@@ -141,10 +145,19 @@ function actualizaMarcador(j: Jugador, d: Record<string, unknown>, fase: string)
   if (!vivo) j.armorName = 'None';
 
   // En compra reaparece todo el mundo: quien sigue muerto ahí no está en el
-  // mapa (abandonó o se cayó). Se le quita la marca en cuanto vuelve vivo.
+  // mapa (abandonó o se cayó). Se le quita la marca en cuanto vuelve vivo. Pero un marcador rezagado de la ronda
+  // anterior (o el primero tras `match_start`) también llega «muerto» en la compra: sólo se marca con evidencia
+  // sostenida, más de 3 s de tiempo de partida Y al menos dos marcadores seguidos así.
   if (typeof d.isAlive === 'boolean') {
-    if (d.isAlive) j.disconnected = false;
-    else if (fase === 'shopping') j.disconnected = true;
+    const visto = p.interno.muertoEnCompra;
+    if (d.isAlive || fase !== 'shopping') {
+      delete visto[j.riotId];
+      if (d.isAlive) j.disconnected = false;
+    } else {
+      const e = (visto[j.riotId] ??= { desde: ahora, n: 0 });
+      e.n += 1;
+      if (e.n >= 2 && ahora - e.desde > DESCONEXION_MS) j.disconnected = true;
+    }
   }
   if (typeof d.hasSpike === 'boolean') j.hasSpike = d.hasSpike;
 }
@@ -285,7 +298,7 @@ export function aplicaMarcadorObservador(p: Partido, d: Record<string, unknown>,
     );
   }
   if (!j) return true;
-  actualizaMarcador(j, d, p.roundPhase);
+  actualizaMarcador(p, j, d, ahora);
   j.scoreboardAvailable = true;
   recalculaGasto(equipo);
   return true;
@@ -302,7 +315,7 @@ export function aplicaMarcadorPropio(p: Partido, d: Record<string, unknown>, aho
   detectaPlantadoPorDinero(p, r?.jugador, d.money, ahora);
   if (!r) return false;
   if (r.jugador.scoreboardAvailable) return true;
-  actualizaMarcador(r.jugador, d, p.roundPhase);
+  actualizaMarcador(p, r.jugador, d, ahora);
   r.jugador.auxiliaryAvailable.scoreboard = true;
   return true;
 }
@@ -328,10 +341,18 @@ export function aplicaMarcadorCompaneros(p: Partido, remitente: unknown, dato: u
   let cambio = false;
   for (const entrada of lista) {
     if (!esObjeto(entrada)) continue;
+    // Sólo se actualiza a jugadores del MISMO equipo que el remitente: un cliente modificado no puede tocar al rival.
     const j = origen.equipo.players.find((x) => x.riotId === entrada.playerId);
+    if (!j) continue;
     detectaPlantadoPorDinero(p, j, entrada.money, ahora);
-    if (!j || j.scoreboardAvailable) continue;
-    actualizaMarcador(j, entrada, p.roundPhase);
+    if (j.scoreboardAvailable) continue;
+    /*
+     * En la COMPRA, el «vivo» de la lista de compañeros no es de fiar (en la ronda 1 llega como `false` para todos):
+     * dejaba a los compañeros muertos y «desconectados» hasta que mandaban su propio marcador. Ahí sólo se toma el resto
+     * (dinero, arma, escudo, ulti); quien está vivo en compra lo deciden el observador y el marcador propio.
+     */
+    const dato = p.roundPhase === 'shopping' && entrada.isAlive === false ? { ...entrada, isAlive: undefined } : entrada;
+    actualizaMarcador(p, j, dato, ahora);
     j.auxiliaryAvailable.scoreboard = true;
     cambio = true;
   }
@@ -450,6 +471,18 @@ export function aplicaIconoEspecial(p: Partido, playerId: unknown, dato: unknown
   return true;
 }
 
+/**
+ * El jugador SIGUE conectado mandando sus datos propios, pero su ficha se recreó (partida nueva, reinicio del
+ * operador, reentrada al partido): se le devuelve la marca de «manda vida». Sólo la marca, no un valor: la vida
+ * sigue siendo la que dice el partido (100 al empezar) hasta que su programa mande la real.
+ */
+export function restauraVida(p: Partido, playerId: string): boolean {
+  const r = jugadorPorId(p, playerId);
+  if (!r || r.jugador.auxiliaryAvailable.health) return false;
+  r.jugador.auxiliaryAvailable.health = true;
+  return true;
+}
+
 /** Un jugador cerró su cliente: deja de aportar datos propios. */
 export function quitaDisponibilidad(p: Partido, playerId: string): boolean {
   const r = jugadorPorId(p, playerId);
@@ -462,6 +495,9 @@ export function quitaDisponibilidad(p: Partido, playerId: string): boolean {
 
 /** Reinicio de cada jugador al empezar una ronda. */
 export function reiniciaRonda(p: Partido, cambioDeLado: boolean): void {
+  // Empieza otra compra: la evidencia de «muerto en compra» de la anterior no cuenta, y el motivo de la ronda que acaba de terminar queda fijo.
+  p.interno.muertoEnCompra = {};
+  p.interno.rondaAbierta = undefined;
   for (const equipo of p.teams) {
     for (const j of equipo.players) {
       j.killsThisRound = 0;
@@ -503,6 +539,19 @@ export function marcaObservado(p: Partido, dato: unknown): void {
   for (const equipo of p.teams) {
     for (const j of equipo.players) j.isObserved = j.searchName === dato;
   }
+}
+
+/**
+ * El operador pide empezar de cero el estado de JUEGO (la lobby nueva, «Quick match», crear sala): ronda,
+ * marcador, historial y TODOS los jugadores salen —los que vuelvan a entrar lo harán por su roster—. No toca
+ * la configuración (equipos, torneo, serie, tiempos muertos). Sirve para quitar lo que quedó de una partida
+ * anterior (p. ej. «ronda 2, LLL 2-0») sin esperar al `match_start` de la siguiente.
+ */
+export function reiniciaPorOrden(p: Partido): void {
+  p.interno.ultimaJugada = Number.MAX_SAFE_INTEGER; // todos los jugadores cuentan como «de la partida anterior»
+  reiniciaParaPartidaNueva(p);
+  p.matchId = '';
+  p.isRunning = false;
 }
 
 /* ── Partida nueva en un partido viejo ──────────────────────────────────── */
@@ -556,4 +605,16 @@ export function reiniciaParaPartidaNueva(p: Partido): void {
   i.ultimoCambioLado = 0;
   i.bandosInvertidos = false;
   i.ultimaJugada = undefined;
+  i.rondaAbierta = undefined;
+  i.ultimaCompra = undefined;
+  i.muertoEnCompra = {};
+  // La selección de agentes de la partida anterior no vale: si ya hay jugadores de ESTA (su roster llegó antes del
+  // `match_start`), el arranque es el roster más antiguo que se les ha visto; si no, vuelve a empezar de cero.
+  const vistos = p.teams.flatMap((e) => e.players.map((j) => i.rosterVisto[j.riotId])).filter((t): t is number => t !== undefined);
+  if (vistos.length > 0) {
+    p.agentSelectStartTime = Math.min(...vistos);
+  } else {
+    p.agentSelectStartTime = undefined;
+    i.hayRoster = false;
+  }
 }

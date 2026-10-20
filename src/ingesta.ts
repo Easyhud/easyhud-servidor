@@ -14,7 +14,7 @@
  */
 
 import type { Server, Socket } from 'socket.io';
-import type { Central } from './central.ts';
+import type { CamaraConfig, Central } from './central.ts';
 import type { Config } from './config.ts';
 import { alarma, error, log } from './log.ts';
 import { emite, leeCarga, respondeYCorta } from './mensajes.ts';
@@ -38,9 +38,20 @@ interface Sesion {
 
 const MAX_TEMPORIZADOR_MS = 2 ** 31 - 1; // ~24,8 días: tope de setTimeout
 
+/** "Nombre#TAG" de Riot: nombre 3–16 (con espacios), tag 3–5 alfanuméricos. Con holgura. */
+const NOMBRE_CAMARA = /^[^#\r\n]{1,32}#[A-Za-z0-9]{2,8}$/;
+
 export interface Ingesta {
   /** Desconecta a todos los autenticados de un grupo (fin del partido). */
   expulsaGrupo(grupo: string): void;
+  /** Manda `cam_config` a los jugadores del grupo. */
+  camaras(grupo: string, config: CamaraConfig): void;
+  /** Manda `te_llaman` a un jugador por su canal de presencia. */
+  llama(puuid: string, carga: { groupCode: string; inviteCode?: string }): void;
+  /** Pide a su programa el informe completo; `false` si no lo tiene abierto. */
+  pideInforme(puuid: string): boolean;
+  /** Una orden remota (de la lista permitida) al programa de un jugador. */
+  ordenJugador(puuid: string, accion: string): boolean;
 }
 
 export function montaIngesta(io: Server, central: Central, config: Config): Ingesta {
@@ -50,21 +61,41 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
   io.on('connection', (socket) => {
     let logonIntentado = false;
     let puuidPresencia = '';
+    /** Descartes ya anotados en el log de este socket (uno por motivo y tipo: un cliente roto no llena el log). */
+    const avisados = new Set<string>();
 
     /* ── Presencia ─────────────────────────────────────────────────────── */
 
-    socket.on('cliente_presente', (msg) => {
+    socket.on('cliente_presente', (msg, ack?: unknown) => {
       const d = leeCarga(msg);
       const puuid = d?.puuid;
       if (typeof puuid !== 'string' || puuid === '') return;
+      // Lo que el exe cuenta de sí mismo (los antiguos no mandan nada: salen «sin diagnóstico»).
+      if (d?.estado !== undefined) central.diagnostico(puuid, d.estado);
       // El mismo socket late ahora con otro puuid (cambio de cuenta): el viejo se deja caer.
       if (puuidPresencia !== '' && puuidPresencia !== puuid && presencia.get(puuidPresencia) === socket) {
         presencia.delete(puuidPresencia);
         central.presenciaCaida(puuidPresencia);
       }
       central.late(puuid);
+      if (presencia.get(puuid) !== socket) log(`presencia: ${puuid.slice(0, 8)}… conectada`);
       presencia.set(puuid, socket);
       puuidPresencia = puuid;
+      // "Call players" sigue en pie: cada latido repite el aviso hasta que entre (el exe ignora los repetidos).
+      const pendiente = central.grupoPendiente(puuid);
+      if (pendiente !== undefined) emite(socket, 'te_llaman', central.llamada(pendiente));
+      // Acuse: el exe lo usa para saber que el servidor le oye de verdad (y no sólo que el socket está abierto).
+      if (typeof ack === 'function') ack({ ok: true, servidor: VERSION_SERVIDOR });
+    });
+
+    // El programa del jugador manda su informe completo (la «caja negra»), a petición o por su botón.
+    socket.on('informe_cliente', (msg, ack?: unknown) => {
+      const d = leeCarga(msg);
+      const puuid = typeof d?.puuid === 'string' && d.puuid !== '' ? d.puuid : puuidPresencia;
+      const informe = d?.informe;
+      const texto = typeof informe === 'string' ? informe : informe !== undefined ? JSON.stringify(informe) : '';
+      const ok = puuid !== '' && central.guardaInforme(puuid, texto);
+      if (typeof ack === 'function') ack({ ok });
     });
 
     /* ── Logon del observador ──────────────────────────────────────────── */
@@ -171,6 +202,7 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
       log(`jugador ${sesion.nombre} en ${sesion.grupo}`);
       central.jugadorConectado(sesion.grupo, sesion.playerId);
       emite(socket, 'aux_logon_ack', { type: 'aux_authenticate', value: true });
+      emite(socket, 'cam_config', central.camaraConfig(sesion.grupo));
     });
 
     /* ── Datos ─────────────────────────────────────────────────────────── */
@@ -203,15 +235,39 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
         return;
       }
 
+      // Cámara: no pasa por el reductor del partido, la gestiona el servidor.
+      if (d.type === 'aux_cam') {
+        if (s.rol === 'jugador') {
+          const dato = d.data as { publishing?: unknown; id?: unknown } | null;
+          const id = typeof dato?.id === 'string' ? dato.id.trim() : '';
+          const valido = dato?.publishing === true && NOMBRE_CAMARA.test(id);
+          central.camara(s.grupo, s.playerId || socket.id, valido ? id : null);
+        }
+        return;
+      }
+
       const paquete: Paquete = { ...d, type: d.type, data: d.data, timestamp: Date.now() };
       if (s.rol === 'jugador') {
-        // Un jugador sólo habla por sí mismo.
-        if (s.playerId !== '') {
-          paquete.playerId = s.playerId;
-        } else if (d.type === 'aux_scoreboard' && typeof d.playerId === 'string' && d.playerId !== '') {
-          s.playerId = d.playerId;
-          central.jugadorConectado(s.grupo, s.playerId);
+        // Un jugador sólo escribe en SU ficha: el `playerId` efectivo es el de su logon, nunca el del cuerpo del paquete
+        // (un cliente modificado podía cambiar dinero, kills o vida de otro). Y el servidor no aprende ni cambia el
+        // `playerId` de un socket a partir de un paquete: sólo del logon.
+        const rechazo = identidadAjena(s, d);
+        if (rechazo !== null) {
+          if (!avisados.has(`${rechazo}|${d.type}`)) {
+            avisados.add(`${rechazo}|${d.type}`);
+            log(`${d.type} de ${s.nombre} (${s.grupo}) descartado: ${rechazo}`);
+          }
+          return;
         }
+        paquete.playerId = s.playerId;
+        // El marcador propio lleva el puuid dentro del dato: se fija al del logon.
+        if (d.type === 'aux_scoreboard' && typeof d.data === 'object' && d.data !== null && !Array.isArray(d.data)) {
+          paquete.data = { ...(d.data as Record<string, unknown>), playerId: s.playerId };
+        }
+      }
+      if (s.rol === 'jugador') central.datoDeJugador(s.grupo, s.playerId, d.type);
+      else if (d.type === 'scoreboard' && typeof (d.data as { playerId?: unknown } | null)?.playerId === 'string') {
+        central.marcadorDe(s.grupo, (d.data as { playerId: string }).playerId);
       }
       try {
         central.graba(s.grupo, paquete);
@@ -228,6 +284,11 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
       if (!s || s.rol !== 'observador') return;
       const d = leeCarga(msg);
       const sala = d?.sala;
+      // `sala: null` = el observador ya no ve ninguna sala (salió de la party): se olvida la vieja.
+      if (d && 'sala' in d && sala === null) {
+        central.limpiaSala(s.grupo);
+        return;
+      }
       if (typeof sala !== 'object' || sala === null || Array.isArray(sala)) return;
       central.guardaSala(s.grupo, sala as Record<string, unknown>);
     });
@@ -240,14 +301,17 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
       }
       const d = leeCarga(msg);
       if (!d || !Array.isArray(d.puuids)) return;
+      // Se sigue llamando a quien aún no tenga el programa abierto; una lista vacía cancela.
+      central.llamaHasta(s.grupo, d.puuids.filter((p): p is string => typeof p === 'string'));
       const avisados: string[] = [];
       for (const puuid of d.puuids) {
         if (typeof puuid !== 'string') continue;
         const destino = presencia.get(puuid);
         if (!destino) continue;
-        emite(destino, 'te_llaman', { groupCode: s.grupo });
+        emite(destino, 'te_llaman', central.llamada(s.grupo));
         avisados.push(puuid);
       }
+      log(`llamada en ${s.grupo}: ${avisados.length}/${d.puuids.length} jugadores con el programa abierto, sala ${central.codigoSala(s.grupo) || '(sin código aún)'}`);
       emite(socket, 'llamar_jugadores_ack', { avisados });
     });
 
@@ -255,6 +319,7 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
 
     socket.on('disconnect', () => {
       if (puuidPresencia !== '' && presencia.get(puuidPresencia) === socket) {
+        log(`presencia: ${puuidPresencia.slice(0, 8)}… desconectada`);
         presencia.delete(puuidPresencia);
         central.presenciaCaida(puuidPresencia);
       }
@@ -262,6 +327,10 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
       if (!s) return;
       sesiones.delete(socket.id);
       if (s.corte) clearTimeout(s.corte);
+      if (s.rol === 'jugador') {
+        central.camara(s.grupo, s.playerId || socket.id, null);
+        central.camara(s.grupo, socket.id, null);
+      }
       if (s.playerId !== '') central.jugadorDesconectado(s.grupo, s.playerId);
       if (s.rol === 'observador') {
         const p = central.partido(s.grupo);
@@ -280,7 +349,43 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
         if (s.grupo === grupo) s.socket.disconnect(true);
       }
     },
+    llama(puuid, carga) {
+      const s = presencia.get(puuid);
+      if (s) emite(s, 'te_llaman', carga);
+    },
+    pideInforme(puuid) {
+      const s = presencia.get(puuid);
+      if (!s) return false;
+      emite(s, 'pide_informe', {});
+      return true;
+    },
+    ordenJugador(puuid, accion) {
+      const s = presencia.get(puuid);
+      if (!s) return false;
+      emite(s, 'orden_remota', { accion });
+      return true;
+    },
+    camaras(grupo, config) {
+      for (const s of sesiones.values()) {
+        if (s.grupo === grupo && s.rol === 'jugador') emite(s.socket, 'cam_config', config);
+      }
+    },
   };
+}
+
+/**
+ * ¿Escribe este paquete de jugador en una ficha que no es la suya? Devuelve el motivo del descarte, o `null` si vale.
+ * Se mira el `playerId` del paquete y, en el marcador propio, el del dato.
+ */
+function identidadAjena(s: Sesion, d: Record<string, unknown>): string | null {
+  if (s.playerId === '') return 'su logon no trajo playerId';
+  const ajeno = (v: unknown) => typeof v === 'string' && v !== '' && v !== s.playerId;
+  if (ajeno(d.playerId)) return 'el playerId del paquete no es el de su logon';
+  const dato = d.data;
+  if (d.type === 'aux_scoreboard' && typeof dato === 'object' && dato !== null && ajeno((dato as Record<string, unknown>).playerId)) {
+    return 'el playerId del marcador no es el de su logon';
+  }
+  return null;
 }
 
 /* ── Del logon a lo que necesita la central ─────────────────────────────── */
