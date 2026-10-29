@@ -13,7 +13,7 @@
 
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
-import { error } from './log.ts';
+import { error, log } from './log.ts';
 
 export interface Grabacion {
   cabecera: Record<string, unknown>;
@@ -23,8 +23,13 @@ export interface Grabacion {
 export class Grabadora {
   private flujo: WriteStream | null;
   readonly ruta: string;
+  private bytes = 0;
+  private readonly maxBytes: number;
+  private llena = false;
 
-  constructor(carpeta: string, grupo: string, cabecera: Record<string, unknown>, ahora = Date.now()) {
+  /** maxBytes: tamaño máximo del fichero; pasado, se deja de anotar (un cliente que inunda no llena el disco). */
+  constructor(carpeta: string, grupo: string, cabecera: Record<string, unknown>, ahora = Date.now(), maxBytes = 64 * 1024 * 1024) {
+    this.maxBytes = maxBytes;
     mkdirSync(carpeta, { recursive: true });
     // El grupo lo elige el cliente: fuera todo lo que no sea seguro en un nombre de fichero.
     const seguro = grupo.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
@@ -34,11 +39,21 @@ export class Grabadora {
       error(`grabación ${this.ruta}`, e);
       this.flujo = null;
     });
-    this.flujo.write(JSON.stringify(cabecera));
+    const inicio = JSON.stringify(cabecera);
+    this.bytes = Buffer.byteLength(inicio);
+    this.flujo.write(inicio);
   }
 
   anota(paquete: unknown): void {
-    this.flujo?.write(`,\n${JSON.stringify(paquete)}`);
+    if (!this.flujo || this.llena) return;
+    const linea = `,\n${JSON.stringify(paquete)}`;
+    this.bytes += Buffer.byteLength(linea);
+    if (this.bytes > this.maxBytes) {
+      this.llena = true;
+      log(`la grabación ${this.ruta} ha pasado de ${Math.round(this.maxBytes / 1024 / 1024)} MB: no se graba más de este partido`);
+      return;
+    }
+    this.flujo.write(linea);
   }
 
   /** Antes el fichero no se cerraba nunca; ahora se cierra al acabar el partido. */

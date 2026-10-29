@@ -9,6 +9,8 @@
  * `Partido.interno`, y el serializador (`serializa.ts`) nunca lo saca.
  */
 
+import type { CajaVictoria, ParcheLimpio } from './saneado.ts';
+
 export type Lado = 0 | 1; // posición en pantalla: 0 = izquierda, 1 = derecha
 
 export type TipoRonda = 'detonated' | 'defused' | 'kills' | 'timeout' | 'lost' | 'upcoming';
@@ -131,7 +133,24 @@ export interface Herramientas {
     base?: string;
     params?: string;
     clave?: string;
+    /**
+     * Quitar el tricode del equipo del principio del nombre de cada jugador al emitir (p. ej. «ABC Nombre» → «Nombre»).
+     * Mismo nombre y sitio que en el servidor original; ausente = false. Lo pone el panel.
+     * Adaptado de ValoSpectra/Spectra-Server (Elastic License 2.0) — model/Team.ts, model/Player.ts
+     */
+    removeTricodes?: boolean;
   };
+  /** Cabeza de serie bajo cada equipo (por LADO de pantalla). Lo pone el panel. */
+  seedingInfo: { left: string; right: string };
+  /**
+   * Alias de visualización: JSON de una lista de pares [«Nombre#TAG», alias], igual que en el original (el overlay
+   * lo parsea). Lo pone el panel con el parche `nameOverrides`; no hay backend externo.
+   */
+  nameOverrides: { overrides: string };
+  /** Qué se pinta en la ceremonia de fin de ronda: nada, el torneo o patrocinadores por ceremonia/equipo. Lo pone el panel. */
+  roundWinBox: CajaVictoria;
+  /** Modo mínimo del overlay (tarjetas sin habilidades). Propio de Easy HUD; el original lo elegía con una ruta. Lo pone el panel. */
+  minimal: boolean;
 }
 
 export interface Rotulo {
@@ -140,7 +159,11 @@ export interface Rotulo {
   message: string;
   duration: number | null;
   eventLogoEnabled: boolean;
-  selectedTeam?: string;
+  /**
+   * `left`, `right` o `none` (aviso de un equipo concreto); ausente = general.
+   * Adaptado de ValoSpectra/Spectra-Server (Elastic License 2.0) — model/eventData.ts (IToastInfo)
+   */
+  selectedTeam?: 'left' | 'right' | 'none';
 }
 
 /** Tiempos muertos y pausa técnica. Los contadores van por EQUIPO DE JUEGO. */
@@ -203,6 +226,8 @@ export interface Interno {
    * empezar la compra siguiente.
    */
   rondaAbierta?: { ronda: number; ganador: Lado };
+  /** La ronda cuyo combate ya empezó: un `combat` repetido de la misma ronda (observador que reenvía) no reinicia sus relojes. */
+  combateRonda?: number;
   /** La ronda (en juego) de la última compra procesada: una compra con número mayor es ronda nueva aunque falten fases. */
   ultimaCompra?: number;
   /**
@@ -210,6 +235,17 @@ export interface Interno {
    * compra. Un marcador rezagado suelto no basta (ver `actualizaMarcador`).
    */
   muertoEnCompra: Record<string, { desde: number; n: number }>;
+  /**
+   * matchIds de partidas de VALORANT que ya terminaron (o que el operador descartó) en este grupo. Tras volver al
+   * menú, el observador puede reenviar el `match_start` (y el mapa y el modo) de la partida VIEJA: un `match_start`
+   * con uno de estos ids no vale. Tope de 8.
+   */
+  idsTerminados: string[];
+  /**
+   * El mapa y el modo que había justo ANTES de la última ráfaga `map`/`game_mode` (con su hora). Si esa ráfaga
+   * acaba en un `match_start` caducado, se vuelve a lo anterior: el mapa y el modo venían de la partida vieja.
+   */
+  antesDeRafaga?: { map: string; matchType: string; switchRound: number; firstOtRound: number; en: number };
 }
 
 export interface Partido {
@@ -285,6 +321,13 @@ export interface MemoriaGrupo {
   equipos: [EquipoGuardado | null, EquipoGuardado | null];
   /** Cámaras: activadas y sala. Sobrevive a los mapas y a configurarse antes del partido. */
   camaras?: { enable?: boolean; identifier?: string };
+  /**
+   * Lo que el panel configuró de torneo, patrocinio, marca, cabezas de serie, alias, caja de victoria y modo
+   * mínimo: vale para los mapas siguientes aunque el logon del observador (que trae valores de fábrica) diga otra cosa.
+   */
+  herramientas?: ParcheLimpio;
+  /** matchIds de partidas que ya terminaron en este grupo (ver `Interno.idsTerminados`). */
+  terminadas?: string[];
 }
 
 /* ── El logon del observador (lo que hace falta para crear el partido) ──── */

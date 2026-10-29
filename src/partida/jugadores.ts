@@ -10,6 +10,7 @@
 import { agenteDeIconoKillfeed, agenteNormalizado, nombreAgente, nombreArma, nombreEscudo } from './tablas.ts';
 import { historialInicial, nuevoJugador, type AltaJugador } from './creacion.ts';
 import { atacaEquipoCero } from './bandos.ts';
+import { LIMITES, linea } from './saneado.ts';
 import type { Equipo, Jugador, Partido } from './tipos.ts';
 
 const MAX_JUGADORES = 5;
@@ -17,9 +18,14 @@ const SPIKE_MS = 45_000;
 const PREMIO_PLANTAR = 300;
 /** Tiempo mínimo (de partida) muerto en la compra para darlo por desconectado. */
 const DESCONEXION_MS = 3_000;
+/** Más dinero que esto en una cuenta es un dato roto (el tope del juego son 9000 más lo que se gane en la ronda). */
+const MAX_DINERO = 99_999;
 
 const esNumero = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const num = (v: unknown, defecto = 0): number => (esNumero(v) ? v : defecto);
+/** Un contador del marcador (bajas, muertes, ulti…): entero entre 0 y `max`; si no, se queda lo que había. */
+const contador = (v: unknown, previo: number, max = 999): number =>
+  esNumero(v) && Number.isInteger(v) && v >= 0 && v <= max ? v : previo;
 const esObjeto = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
@@ -99,16 +105,16 @@ function cambiaAgente(j: Jugador, agente: string): void {
  */
 function actualizaMarcador(p: Partido, j: Jugador, d: Record<string, unknown>, ahora: number): void {
   const fase = p.roundPhase;
-  const kills = num(d.kills, j.kills);
-  const deaths = num(d.deaths, j.deaths);
-  const assists = num(d.assists, j.assists);
-  const ult = num(d.currUltPoints, j.currUltPoints);
-  const ultMax = num(d.maxUltPoints, j.maxUltPoints);
+  const kills = contador(d.kills, j.kills);
+  const deaths = contador(d.deaths, j.deaths);
+  const assists = contador(d.assists, j.assists);
+  const ult = contador(d.currUltPoints, j.currUltPoints, 99);
+  const ultMax = contador(d.maxUltPoints, j.maxUltPoints, 99);
 
   if (kills > j.kills) j.killsThisRound += 1;
   if (deaths > j.deaths) j.deathsThisRound += 1;
 
-  if (typeof d.agentInternal === 'string') cambiaAgente(j, d.agentInternal);
+  if (typeof d.agentInternal === 'string' && d.agentInternal.length <= LIMITES.agente) cambiaAgente(j, d.agentInternal);
 
   reglasDeIcono(j, { kills, deaths, assists, currUltPoints: ult });
 
@@ -121,7 +127,7 @@ function actualizaMarcador(p: Partido, j: Jugador, d: Record<string, unknown>, a
   j.ultReady = ult >= ultMax && ultMax > 0;
 
   // Gasto de la ronda (se mantiene la cuenta heredada: puede bajar si entra dinero).
-  if (esNumero(d.money)) {
+  if (esNumero(d.money) && d.money >= 0 && d.money <= MAX_DINERO) {
     if (!j.spentMoneyThisRound && d.money < j.money) j.spentMoneyThisRound = true;
     if (j.spentMoneyThisRound && d.money !== j.money) j.moneySpent += j.money - d.money;
     j.money = d.money;
@@ -241,12 +247,12 @@ export function aplicaRoster(p: Partido, d: Record<string, unknown>, ahora: numb
   const equipo = equipoDeJuego(p, d.startTeam);
   if (!equipo) return false;
 
-  const playerId = typeof d.playerId === 'string' ? d.playerId : '';
-  const nombre = typeof d.name === 'string' ? d.name : '';
-  const tag = typeof d.tagline === 'string' ? d.tagline : '';
+  const playerId = typeof d.playerId === 'string' && d.playerId.length <= LIMITES.idJugador ? d.playerId : '';
+  const nombre = linea(d.name, LIMITES.nombreJugador) ?? '';
+  const tag = linea(d.tagline, 16) ?? '';
   if (playerId === '' || nombre === '' || tag === '') return true;
 
-  const agente = typeof d.agentInternal === 'string' ? d.agentInternal : '';
+  const agente = typeof d.agentInternal === 'string' && d.agentInternal.length <= LIMITES.agente ? d.agentInternal : '';
   const existente = equipo.players.find((j) => j.riotId === playerId);
   if (existente) {
     existente.name = nombre;
@@ -281,15 +287,16 @@ export function aplicaMarcadorObservador(p: Partido, d: Record<string, unknown>,
   const previo = equipo.players.find((x) => x.riotId === d.playerId);
   detectaPlantadoPorDinero(p, previo, d.money, ahora);
   let j = previo;
-  if (!j && typeof d.playerId === 'string' && d.playerId !== '' && typeof d.name === 'string' && d.name !== '') {
+  const nombreAlta = linea(d.name, LIMITES.nombreJugador) ?? '';
+  if (!j && typeof d.playerId === 'string' && d.playerId !== '' && d.playerId.length <= LIMITES.idJugador && nombreAlta !== '') {
     j = daDeAlta(
       p,
       equipo,
       {
         playerId: d.playerId,
-        name: d.name,
-        tagline: typeof d.tagline === 'string' ? d.tagline : '',
-        agentInternal: typeof d.agentInternal === 'string' ? d.agentInternal : '',
+        name: nombreAlta,
+        tagline: linea(d.tagline, 16) ?? '',
+        agentInternal: typeof d.agentInternal === 'string' && d.agentInternal.length <= LIMITES.agente ? d.agentInternal : '',
         position: equipo.players.length,
         locked: true,
         rank: 0,
@@ -339,7 +346,7 @@ export function aplicaMarcadorCompaneros(p: Partido, remitente: unknown, dato: u
   if (!origen) return false;
 
   let cambio = false;
-  for (const entrada of lista) {
+  for (const entrada of lista.slice(0, 10)) {
     if (!esObjeto(entrada)) continue;
     // Sólo se actualiza a jugadores del MISMO equipo que el remitente: un cliente modificado no puede tocar al rival.
     const j = origen.equipo.players.find((x) => x.riotId === entrada.playerId);
@@ -347,11 +354,12 @@ export function aplicaMarcadorCompaneros(p: Partido, remitente: unknown, dato: u
     detectaPlantadoPorDinero(p, j, entrada.money, ahora);
     if (j.scoreboardAvailable) continue;
     /*
-     * En la COMPRA, el «vivo» de la lista de compañeros no es de fiar (en la ronda 1 llega como `false` para todos):
+     * Fuera del COMBATE (compra, lobby, selección de agentes), el «vivo» de la lista de compañeros no es de fiar (en la
+     * ronda 1 llega como `false` para todos, y en el lobby de las grabaciones reales también):
      * dejaba a los compañeros muertos y «desconectados» hasta que mandaban su propio marcador. Ahí sólo se toma el resto
      * (dinero, arma, escudo, ulti); quien está vivo en compra lo deciden el observador y el marcador propio.
      */
-    const dato = p.roundPhase === 'shopping' && entrada.isAlive === false ? { ...entrada, isAlive: undefined } : entrada;
+    const dato = p.roundPhase !== 'combat' && p.roundPhase !== 'end' && entrada.isAlive === false ? { ...entrada, isAlive: undefined } : entrada;
     actualizaMarcador(p, j, dato, ahora);
     j.auxiliaryAvailable.scoreboard = true;
     cambio = true;
@@ -367,7 +375,7 @@ export function aplicaKillfeed(p: Partido, d: Record<string, unknown>): void {
   for (const equipo of p.teams) {
     const a = atacante === undefined ? undefined : equipo.players.find((j) => j.name === atacante);
     if (a) {
-      if (victima !== undefined) a.killedPlayerNames.push(victima);
+      if (victima !== undefined && a.killedPlayerNames.length < 10) a.killedPlayerNames.push(victima.slice(0, LIMITES.nombreJugador));
       if (d.headshotKill === true) a.headshotKills += 1;
       if (d.isTeamkill === true) a.teamKills += 1;
 
@@ -404,7 +412,7 @@ export function aplicaKillfeed(p: Partido, d: Record<string, unknown>): void {
 export function aplicaVida(p: Partido, playerId: unknown, dato: unknown): boolean {
   const r = jugadorPorId(p, playerId);
   if (!r || !esNumero(dato)) return false;
-  r.jugador.health = dato;
+  r.jugador.health = Math.min(100, Math.max(0, dato));
   r.jugador.auxiliaryAvailable.health = true;
   return true;
 }
@@ -549,12 +557,21 @@ export function marcaObservado(p: Partido, dato: unknown): void {
  */
 export function reiniciaPorOrden(p: Partido): void {
   p.interno.ultimaJugada = Number.MAX_SAFE_INTEGER; // todos los jugadores cuentan como «de la partida anterior»
+  recuerdaTerminada(p, p.matchId); // el observador puede reenviar su match_start más tarde: ya no vale
   reiniciaParaPartidaNueva(p);
   p.matchId = '';
   p.isRunning = false;
 }
 
 /* ── Partida nueva en un partido viejo ──────────────────────────────────── */
+
+/** Anota un matchId como terminado o descartado (tope de 8: sólo importan los últimos). */
+export function recuerdaTerminada(p: Partido, matchId: string): void {
+  if (matchId === '') return;
+  const lista = p.interno.idsTerminados;
+  if (!lista.includes(matchId)) lista.push(matchId);
+  while (lista.length > 8) lista.shift();
+}
 
 /**
  * Llegó una partida de VALORANT distinta (otro matchId) a un partido que ya
@@ -607,6 +624,7 @@ export function reiniciaParaPartidaNueva(p: Partido): void {
   i.ultimaJugada = undefined;
   i.rondaAbierta = undefined;
   i.ultimaCompra = undefined;
+  i.combateRonda = undefined;
   i.muertoEnCompra = {};
   // La selección de agentes de la partida anterior no vale: si ya hay jugadores de ESTA (su roster llegó antes del
   // `match_start`), el arranque es el roster más antiguo que se les ha visto; si no, vuelve a empezar de cero.

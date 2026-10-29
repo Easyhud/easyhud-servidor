@@ -15,7 +15,8 @@ import type { Server, Socket } from 'socket.io';
 import type { Central, Difusion } from './central.ts';
 import type { Config } from './config.ts';
 import { log } from './log.ts';
-import { emite, leeCarga, respondeYCorta } from './mensajes.ts';
+import { Limitador, emite, escucha, explicaPermiso, identificadorValido, leeCarga, respondeYCorta } from './mensajes.ts';
+import { normalizaParche } from './partida/saneado.ts';
 import { type Veredicto, validaToken } from './token.ts';
 
 /**
@@ -58,7 +59,7 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
 
   io.on('connection', (socket: Socket) => {
     let hecho = false;
-    socket.on('logon', (msg) => {
+    escucha(socket, 'logon', (msg) => {
       if (hecho) return;
       const d = leeCarga(msg);
       if (!d) {
@@ -67,10 +68,10 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
       }
       hecho = true;
       const grupo = typeof d.groupCode === 'string' ? d.groupCode : '';
-      const v = grupo === '' || grupo.includes('\u0001') ? { valido: false, motivo: 'sin groupCode' } : validaMirada(d.token, grupo);
+      const v: Veredicto = !identificadorValido(grupo) ? { valido: false, motivo: 'sin groupCode' } : validaMirada(d.token, grupo);
       if (!v.valido) {
-        log(`logon de overlay denegado (${grupo}): ${v.motivo}`);
-        respondeYCorta(socket, 'logon_denied', { reason: v.motivo });
+        log(`logon de overlay denegado (${grupo.slice(0, 64)}): ${v.motivo}`);
+        respondeYCorta(socket, 'logon_denied', { reason: explicaPermiso(v.motivo, v.clase), codigo: v.motivo });
         return;
       }
       void socket.join(grupo);
@@ -81,23 +82,34 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
       emite(socket, 'logon_success', { groupCode: grupo, msg: `Logon succeeded for group code ${grupo}` });
       central.enviaAhora(grupo);
       central.difundeSala(grupo);
-    });
+    }, new Limitador(10, 2));
   });
 
   /* ── Mandar ────────────────────────────────────────────────────────────── */
 
   io.of('/operador').on('connection', (socket: Socket) => {
     let grupo: string | null = null;
+    /** Lo que se le deja hacer al panel: de sobra para un humano, poco para un bucle roto. */
+    const ritmo = new Limitador(60, 30);
+    const alExceder = () => {
+      if (ritmo.descartados % 50 === 1) {
+        emite(socket, 'operador_error', {
+          reason: 'Demasiadas órdenes seguidas: el servidor ignora el exceso para proteger el directo. Espera un momento y repite lo último.',
+          codigo: 'demasiado_rapido',
+        });
+      }
+    };
+    const enMando = (evento: string, fn: (msg: unknown) => void) => escucha(socket, evento, fn, ritmo, alExceder);
 
-    socket.on('operador_logon', (msg) => {
+    enMando('operador_logon', (msg) => {
       const d = leeCarga(msg);
       if (!d) return;
       const g = typeof d.groupCode === 'string' ? d.groupCode : '';
-      const v = g === '' ? { valido: false, motivo: 'sin groupCode' } : validaMando(d.token, g);
+      const v: Veredicto = !identificadorValido(g) ? { valido: false, motivo: 'sin groupCode' } : validaMando(d.token, g);
       if (!v.valido) {
-        log(`operador denegado (${g}): ${v.motivo}`);
+        log(`operador denegado (${g.slice(0, 64)}): ${v.motivo}`);
         grupo = null;
-        respondeYCorta(socket, 'operador_denegado', { reason: v.motivo });
+        respondeYCorta(socket, 'operador_denegado', { reason: explicaPermiso(v.motivo, v.clase), codigo: v.motivo });
         return;
       }
       grupo = g;
@@ -105,7 +117,7 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
       emite(socket, 'operador_listo', { groupCode: g });
     });
 
-    socket.on('orden', (msg) => {
+    enMando('orden', (msg) => {
       if (grupo === null) return;
       const d = leeCarga(msg);
       if (!d) return;
@@ -146,8 +158,15 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
         return;
       }
       const equivalente = typeof tipo === 'string' && Object.hasOwn(ORDENES, tipo) ? ORDENES[tipo] : undefined;
-      if (!equivalente || !central.partido(grupo)) {
-        emite(socket, 'operador_error', { reason: `orden no aplicada: ${String(tipo)}` });
+      if (!equivalente) {
+        emite(socket, 'operador_error', { reason: `orden no aplicada: ${String(tipo).slice(0, 40)}` });
+        return;
+      }
+      if (!central.partido(grupo)) {
+        emite(socket, 'operador_error', {
+          reason: `La orden «${String(tipo)}» no se ha aplicado: todavía no hay partido en este grupo (el observador no ha conectado). Abre el observador y repítela.`,
+          codigo: 'sin_partido',
+        });
         return;
       }
       const paquete = {
@@ -162,19 +181,28 @@ export function montaSalida(io: Server, central: Central, config: Config): Omit<
     });
 
     // El panel pregunta quién tiene el programa abierto (fichas de equipo y "Call players").
-    socket.on('presencia_consulta', (msg) => {
+    enMando('presencia_consulta', (msg) => {
       if (grupo === null) return;
       const d = leeCarga(msg);
       const lista = Array.isArray(d?.puuids) ? d.puuids.filter((p): p is string => typeof p === 'string').slice(0, 200) : [];
       emite(socket, 'presencia', { activos: central.activos(grupo, lista), estado: central.estadoJugadores(grupo, lista) });
     });
 
-    socket.on('configura', (msg) => {
+    enMando('configura', (msg) => {
       if (grupo === null) return;
       const parche = leeCarga(msg);
       if (!parche) return;
+      // Lo que no tiene el tipo o el tamaño correcto se descarta (y se dice qué): el panel lo enseña.
+      const { avisos } = normalizaParche(parche);
       if (!central.configura(grupo, parche)) {
         emite(socket, 'operador_error', { reason: 'sin partido para configurar' });
+      }
+      if (avisos.length > 0) {
+        emite(socket, 'operador_error', {
+          reason: `Algún ajuste no se ha aplicado tal cual: ${avisos.slice(0, 3).join('; ')}.`,
+          codigo: 'ajuste_corregido',
+          avisos,
+        });
       }
     });
   });
@@ -206,7 +234,7 @@ function datosRotulo(datos: unknown): Record<string, unknown> {
     active: typeof d.active === 'boolean' ? d.active : undefined,
     title: typeof d.title === 'string' ? d.title : '',
     message: typeof d.message === 'string' ? d.message : '',
-    duration: typeof d.duration === 'number' && Number.isFinite(d.duration) ? d.duration * 1000 : null,
+    duration: typeof d.duration === 'number' && Number.isFinite(d.duration) ? Math.min(d.duration, 3600) * 1000 : null,
     eventLogoEnabled: d.eventLogoEnabled !== false,
     selectedTeam: d.selectedTeam,
   };

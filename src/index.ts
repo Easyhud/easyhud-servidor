@@ -31,6 +31,23 @@ if (config.sinAutenticacion) {
   );
 }
 
+// Un fallo inesperado en un manejador no debe llevarse por delante un directo: se registra y se sigue. Si pasa sin
+// parar (más de 50 veces en un minuto) algo está roto de verdad y se sale para que Docker reinicie el servidor.
+const FALLOS_POR_MINUTO = 50;
+const fallos: number[] = [];
+function fallo(origen: string, e: unknown): void {
+  error(`fallo no controlado (${origen})`, e);
+  const ahora = Date.now();
+  fallos.push(ahora);
+  while (fallos.length > 0 && ahora - fallos[0] > 60_000) fallos.shift();
+  if (fallos.length > FALLOS_POR_MINUTO) {
+    error('demasiados fallos seguidos: el servidor se reinicia');
+    process.exit(1);
+  }
+}
+process.on('uncaughtException', (e) => fallo('uncaughtException', e));
+process.on('unhandledRejection', (e) => fallo('unhandledRejection', e));
+
 const servidor = await arranca(config);
 
 async function apaga(senal: string) {

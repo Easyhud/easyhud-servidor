@@ -126,12 +126,17 @@ test('overlay: sin token o con token de otro grupo, logon_denied', async () => {
   const s = conecta(servidor.puertos.salida);
   const denegado = espera(s, 'logon_denied');
   s.emit('logon', JSON.stringify({ groupCode: 'TORNEO2', token: '' }));
-  assert.deepEqual(await denegado, { reason: 'sin token' });
+  // El motivo ahora es una frase accionable (qué pasó y qué hacer); el texto técnico de antes va en codigo.
+  const d1 = await denegado;
+  assert.equal(d1.codigo, 'sin token');
+  assert.match(d1.reason, /Falta el permiso de emisión/);
 
   const s2 = conecta(servidor.puertos.salida);
   const denegado2 = espera(s2, 'logon_denied');
   s2.emit('logon', JSON.stringify({ groupCode: 'TORNEO2', token: firmaToken('OTRO', 1, 'c', SECRETO) }));
-  assert.deepEqual(await denegado2, { reason: 'es para el grupo OTRO' });
+  const d2 = await denegado2;
+  assert.equal(d2.codigo, 'es para el grupo OTRO');
+  assert.match(d2.reason, /otra cuenta o de otro evento/);
 });
 
 test('reproducción de una grabación real: el overlay recibe match_data', async () => {
@@ -285,7 +290,9 @@ test('operador: token inválido → operador_denegado', async () => {
   const mando = conecta(servidor.puertos.salida, '/operador');
   const denegado = espera(mando, 'operador_denegado');
   mando.emit('operador_logon', JSON.stringify({ groupCode: 'X', token: 'malo' }));
-  assert.deepEqual(await denegado, { reason: 'token mal formado' });
+  const d = await denegado;
+  assert.equal(d.codigo, 'token mal formado');
+  assert.match(d.reason, /no es válido/);
 });
 
 test('presencia y "Call players"', async () => {

@@ -6,6 +6,7 @@
 
 import { nombreAgente } from './tablas.ts';
 import { aplicaEquiposGuardados } from './configuracion.ts';
+import { LIMITES, aplicaHerramientas, linea, normalizaParche } from './saneado.ts';
 import type {
   DatosCreacion,
   EntradaRonda,
@@ -34,7 +35,6 @@ export const esNumero = (v: unknown): v is number => typeof v === 'number' && Nu
 
 const texto = (v: unknown, defecto = ''): string => (typeof v === 'string' ? v : defecto);
 const numero = (v: unknown, defecto: number): number => (esNumero(v) ? v : defecto);
-const booleano = (v: unknown, defecto: boolean): boolean => (typeof v === 'boolean' ? v : defecto);
 
 /* ── Configuración ──────────────────────────────────────────────────────── */
 
@@ -48,81 +48,30 @@ export function herramientasPorDefecto(): Herramientas {
     sponsorInfo: { enabled: false, duration: 5, sponsors: [] },
     watermarkInfo: { brandWatermark: false, customTextEnabled: false, customText: '' },
     playercamsInfo: { enable: false, identifier: '', enabledPlayers: [] },
+    seedingInfo: { left: '', right: '' },
+    nameOverrides: { overrides: '[]' },
+    roundWinBox: { type: 'disabled', sponsors: [] },
+    minimal: false,
   };
 }
 
 /**
  * Configuración inicial: los valores por defecto con lo que traiga el logon
- * encima, subobjeto a subobjeto. Los campos que falten en el logon se quedan
- * con el valor por defecto (antes quedaban ausentes), y los que lleguen con
- * un tipo que no toca se descartan.
+ * encima, subobjeto a subobjeto, pasando por el MISMO saneado que los parches
+ * del panel (`normalizaParche`): los campos que falten se quedan con el valor
+ * por defecto y los que lleguen con un tipo o un tamaño que no toca se descartan.
  */
 export function construyeHerramientas(toolsData: Record<string, unknown>): Herramientas {
   const h = herramientasPorDefecto();
-
-  const serie = toolsData.seriesInfo;
-  if (esObjeto(serie)) {
-    h.seriesInfo = {
-      needed: numero(serie.needed, 1),
-      wonLeft: numero(serie.wonLeft, 0),
-      wonRight: numero(serie.wonRight, 0),
-      mapInfo: Array.isArray(serie.mapInfo) ? structuredClone(serie.mapInfo) : [],
-    };
-  }
-
-  const torneo = toolsData.tournamentInfo;
-  if (esObjeto(torneo)) {
-    h.tournamentInfo = {
-      name: texto(torneo.name),
-      logoUrl: texto(torneo.logoUrl),
-      backdropUrl: texto(torneo.backdropUrl),
-    };
-  }
-
-  h.timeoutDuration = numero(toolsData.timeoutDuration, h.timeoutDuration);
-  h.timeoutCancellationGracePeriod = numero(
-    toolsData.timeoutCancellationGracePeriod,
-    h.timeoutCancellationGracePeriod,
+  const { limpio } = normalizaParche(toolsData);
+  aplicaHerramientas(h, limpio);
+  if (limpio.timeoutCounter?.max !== undefined) h.timeoutMax = limpio.timeoutCounter.max;
+  h.timeoutCancellationGracePeriod = Math.min(
+    h.timeoutDuration,
+    Math.max(0, numero(toolsData.timeoutCancellationGracePeriod, h.timeoutCancellationGracePeriod)),
   );
-
-  const contador = toolsData.timeoutCounter;
-  if (esObjeto(contador) && esNumero(contador.max) && contador.max >= 0) {
-    h.timeoutMax = Math.floor(contador.max);
-  }
-
-  const patrocinio = toolsData.sponsorInfo;
-  if (esObjeto(patrocinio)) {
-    h.sponsorInfo = {
-      enabled: booleano(patrocinio.enabled, false),
-      duration: numero(patrocinio.duration, 5),
-      sponsors: Array.isArray(patrocinio.sponsors) ? structuredClone(patrocinio.sponsors) : [],
-    };
-  }
-
-  const marca = toolsData.watermarkInfo;
-  if (esObjeto(marca)) {
-    h.watermarkInfo = {
-      brandWatermark: false, // Easy HUD no lleva marca de agua de terceros, se mande lo que se mande
-      customTextEnabled: booleano(marca.customTextEnabled, false),
-      customText: texto(marca.customText),
-    };
-  }
-
-  const camaras = toolsData.playercamsInfo;
-  if (esObjeto(camaras)) {
-    // `secret` y `endTime` se descartan aquí mismo: no hay backend de cámaras.
-    h.playercamsInfo = {
-      enable: booleano(camaras.enable, false),
-      identifier: texto(camaras.identifier),
-      enabledPlayers: Array.isArray(camaras.enabledPlayers)
-        ? camaras.enabledPlayers.filter((p): p is string => typeof p === 'string')
-        : [],
-    };
-  }
-
   return h;
 }
-
 /* ── Equipos y jugadores ────────────────────────────────────────────────── */
 
 export function historialInicial(ataca: boolean): EntradaRonda[] {
@@ -136,9 +85,9 @@ export function historialInicial(ataca: boolean): EntradaRonda[] {
 export function nuevoEquipo(logon: EquipoLogon): Equipo {
   const ataca = logon.attackStart === true;
   return {
-    teamName: texto(logon.name),
-    teamTricode: texto(logon.tricode),
-    teamUrl: texto(logon.url),
+    teamName: linea(logon.name, LIMITES.nombreEquipo) ?? '',
+    teamTricode: linea(logon.tricode, LIMITES.tricode) ?? '',
+    teamUrl: texto(logon.url).slice(0, LIMITES.url),
     ingameTeamId: (ataca ? 0 : 1) as Lado,
     isAttacking: ataca,
     hasHandledTeam: false,
@@ -228,6 +177,8 @@ export function creaPartido(d: DatosCreacion, memoria: MemoriaGrupo | undefined,
   if (memoria?.tiempos?.duracion !== undefined) tools.timeoutDuration = memoria.tiempos.duracion;
   if (memoria?.camaras?.enable !== undefined) tools.playercamsInfo.enable = memoria.camaras.enable;
   if (memoria?.camaras?.identifier !== undefined) tools.playercamsInfo.identifier = memoria.camaras.identifier;
+  // Torneo, patrocinio, marca, cabezas de serie, alias, caja de victoria y modo mínimo que el panel dejó para este grupo.
+  if (memoria?.herramientas) aplicaHerramientas(tools, memoria.herramientas);
   const max = tools.timeoutMax;
 
   const p: Partido = {
@@ -263,6 +214,7 @@ export function creaPartido(d: DatosCreacion, memoria: MemoriaGrupo | undefined,
       registrados: [[], []],
       rosterVisto: {},
       muertoEnCompra: {},
+      idsTerminados: [...(memoria?.terminadas ?? [])],
     },
   };
 

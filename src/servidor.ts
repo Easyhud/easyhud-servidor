@@ -41,6 +41,13 @@ const OPCIONES_SOCKET: Partial<ServerOptions> = {
   },
 };
 
+/**
+ * Tope del tamaño de UN mensaje (socket.io corta la conexión si se pasa). Ingesta: el informe completo de un PC
+ * ocupa hasta ~600 KB. Salida: un parche del panel son unos KB; 256 KB sobra y un cliente roto no puede mandar megas.
+ */
+const MAX_MENSAJE_INGESTA = 1_000_000;
+const MAX_MENSAJE_SALIDA = 256 * 1024;
+
 function creaServidorHttp(config: Config, manejador?: (req: IncomingMessage, res: ServerResponse) => void): ServidorHttp {
   if (config.inseguro) return creaHttp(manejador);
   const opciones = { key: readFileSync(config.claveTls as string), cert: readFileSync(config.certTls as string) };
@@ -83,11 +90,11 @@ export async function arranca(config: Config): Promise<Servidor> {
   const central = new Central(config);
 
   const httpSalida = creaServidorHttp(config);
-  const ioSalida = new Server(httpSalida, OPCIONES_SOCKET);
+  const ioSalida = new Server(httpSalida, { ...OPCIONES_SOCKET, maxHttpBufferSize: MAX_MENSAJE_SALIDA });
   const salida = montaSalida(ioSalida, central, config);
 
   const httpIngesta = creaServidorHttp(config);
-  const ioIngesta = new Server(httpIngesta, OPCIONES_SOCKET);
+  const ioIngesta = new Server(httpIngesta, { ...OPCIONES_SOCKET, maxHttpBufferSize: MAX_MENSAJE_INGESTA });
   const ingesta = montaIngesta(ioIngesta, central, config);
 
   central.conecta({ ...salida, expulsaGrupo: ingesta.expulsaGrupo, camaras: ingesta.camaras, llama: ingesta.llama, pideInforme: ingesta.pideInforme, ordenJugador: ingesta.ordenJugador });

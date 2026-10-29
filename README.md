@@ -8,6 +8,12 @@ grupo.
 **Implementación original de Easy HUD.** Habla el protocolo que usan el
 cliente de escritorio y el overlay de Easy HUD.
 
+> **Rama `copia-funcional`:** aquí se adaptan trozos del servidor de ValoSpectra
+> (`Spectra-Server`, **Elastic License 2.0**; cada trozo lleva su atribución en un
+> comentario). Uso propio, sin ofrecerlo como servicio a terceros. Ver
+> `COPIA-FUNCIONAL.md` en la carpeta raíz del proyecto. Esta rama no se mezcla con
+> `master` sin decidirlo expresamente.
+
 ## Puertos
 
 | Puerto | Qué | Quién |

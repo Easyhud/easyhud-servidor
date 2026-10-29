@@ -44,6 +44,8 @@ const CONOCIDO_MS = 6 * 60 * 60 * 1000;
 /** Cada cuánto se repite el aviso a quien aún no está dentro de la sala de Riot. */
 const INSISTENCIA_MS = 6_000;
 const OLVIDO_LATIDO_MS = 10 * 60_000;
+/** Cuánto se guarda el diagnóstico o el informe de un jugador que dejó de latir. */
+const OLVIDO_DIAGNOSTICO_MS = 60 * 60_000;
 /** Saca del informe las conclusiones (validadas y acotadas): es texto que viene de un cliente. */
 function leeConclusiones(texto: string): ConclusionInforme[] {
   try {
@@ -202,6 +204,11 @@ export class Central {
     return this.partidos.size;
   }
 
+  /** ¿Hay ya tantos partidos vivos como permite `MAX_PARTIDOS`? (un grupo que ya tiene el suyo no cuenta: puede reconectar) */
+  completo(grupo: string): boolean {
+    return !this.partidos.has(grupo) && this.partidos.size >= (this.config.maxPartidos ?? 100);
+  }
+
   /** El primer partido cuyo matchId sea ése. Un matchId vacío no casa con nada. */
   partidoPorMatchId(matchId: string): PartidoVivo | undefined {
     if (matchId === '') return undefined;
@@ -216,7 +223,7 @@ export class Central {
     let grabadora: Grabadora | null = null;
     if (this.config.grabar) {
       try {
-        grabadora = new Grabadora(this.config.carpetaGrabaciones, grupo, cabecera, this.ahora());
+        grabadora = new Grabadora(this.config.carpetaGrabaciones, grupo, cabecera, this.ahora(), (this.config.maxGrabacionMb ?? 64) * 1024 * 1024);
       } catch (e) {
         error(`no se pudo abrir la grabación del grupo ${grupo}`, e);
       }
@@ -264,6 +271,7 @@ export class Central {
     const p = this.partidos.get(grupo);
     if (!p) return;
     this.partidos.delete(grupo);
+    this.recuerdaTerminadas(grupo, p.estado.interno.idsTerminados);
     p.grabadora?.cierra();
     this.salas.delete(grupo);
     this.conectados.delete(grupo);
@@ -275,6 +283,19 @@ export class Central {
     log(`partido del grupo ${grupo} destruido (${motivo})`);
     this.difusion?.expulsaGrupo(grupo);
     if (this.partidos.size === 0) this.paraBucle();
+  }
+
+  /**
+   * Los matchIds que ya terminaron en este grupo se recuerdan más allá del partido: el observador, al volver del menú,
+   * puede reenviar el `match_start` de la partida vieja al partido NUEVO, y éste no debe creérselo.
+   */
+  private recuerdaTerminadas(grupo: string, ids: readonly string[]): void {
+    if (ids.length === 0) return;
+    const m = this.memorias.get(grupo) ?? memoriaVacia();
+    const lista = new Set([...(m.terminadas ?? []), ...ids]);
+    m.terminadas = [...lista].slice(-8);
+    this.memorias.set(grupo, m);
+    this.usoGrupo.set(grupo, this.ahora());
   }
 
   /** Graba un paquete en la grabación del partido (antes de procesarlo). */
@@ -446,12 +467,18 @@ export class Central {
     const ahora = this.ahora();
     const limiteInactividad = this.config.minutosInactividad * 60_000;
     for (const p of [...this.partidos.values()]) {
-      this.procesa(p.grupo, { type: '@reloj', timestamp: ahora });
-      if (!this.partidos.has(p.grupo)) continue;
-      if (p.version > p.enviada) this.envia(p);
-      // Sólo caduca el partido ABANDONADO (sin observador). Con el observador conectado, que no lleguen
-      // datos es normal (menú, lobby, rango): echarlo lo dejaba sin conexión y sin poder llamar a nadie.
-      else if (p.dueno === null && ahora - p.ultimoEnvio > limiteInactividad) this.destruye(p.grupo, 'inactividad');
+      // Un partido que falla no puede dejar sin envíos a los demás: cada uno va en su propio try.
+      try {
+        this.procesa(p.grupo, { type: '@reloj', timestamp: ahora });
+        if (!this.partidos.has(p.grupo)) continue;
+        if (p.version > p.enviada) this.envia(p);
+        // Sólo caduca el partido ABANDONADO (sin observador). Con el observador conectado, que no lleguen
+        // datos es normal (menú, lobby, rango): echarlo lo dejaba sin conexión y sin poder llamar a nadie.
+        else if (p.dueno === null && ahora - p.ultimoEnvio > limiteInactividad) this.destruye(p.grupo, 'inactividad');
+      } catch (e) {
+        error(`el bucle de envío falló en el grupo ${p.grupo}`, e);
+        p.enviada = p.version; // no reintentar el mismo envío roto diez veces por segundo
+      }
     }
   }
 
@@ -783,6 +810,14 @@ export class Central {
         this.vivos.delete(puuid);
       }
     }
+    // Lo que se guarda por jugador o por grupo y nadie vuelve a leer también caduca (antes sólo crecía).
+    for (const [puuid, d] of this.diagnosticos) if (ahora - d.recibido > OLVIDO_DIAGNOSTICO_MS) this.diagnosticos.delete(puuid);
+    for (const [puuid, i] of this.informes) if (ahora - i.recibido > OLVIDO_DIAGNOSTICO_MS) this.informes.delete(puuid);
+    for (const [grupo, c] of this.conocidos) {
+      for (const [puuid, t] of c) if (ahora - t > CONOCIDO_MS) c.delete(puuid);
+      if (c.size === 0 && !this.partidos.has(grupo)) this.conocidos.delete(grupo);
+    }
+    for (const [grupo, p] of this.pendientes) if (p.hasta < ahora) this.pendientes.delete(grupo);
     for (const [grupo, t] of this.usoGrupo) {
       if (this.partidos.has(grupo)) {
         this.usoGrupo.set(grupo, ahora);

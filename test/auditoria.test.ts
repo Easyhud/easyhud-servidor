@@ -25,7 +25,7 @@ const jug = (b: Banco, id: string) => b.estado.teams.flatMap((t) => t.players).f
 test('S1 mapas: cada código conocido da su nombre (Plummet = Summit) y uno desconocido no se vuelve Corrode', () => {
   const conocidos: Record<string, string> = {
     Infinityy: 'Abyss', Triad: 'Haven', Duality: 'Bind', Bonsai: 'Split', Ascent: 'Ascent', Port: 'Icebox',
-    Foxtrot: 'Breeze', Canyon: 'Fracture', Pitt: 'Pearl', Jam: 'Lotus', Juliett: 'Sunset', Range: 'Practice Range',
+    Foxtrot: 'Breeze', Canyon: 'Fracture', Pitt: 'Pearl', Jam: 'Lotus', Juliett: 'Sunset', Range: 'The Range', // antes «Practice Range»: no casaba con 	herange del panel ni con el nombre de valorant-api
     Rook: 'Corrode', Plummet: 'Summit',
   };
   for (const [codigo, nombre] of Object.entries(conocidos)) assert.equal(nombreMapa(codigo), nombre, codigo);

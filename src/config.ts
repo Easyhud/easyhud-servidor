@@ -30,6 +30,10 @@ export interface Config {
   extraProrroga: number;
   /** Minutos sin envíos tras los que un partido se da por abandonado. */
   minutosInactividad: number;
+  /** Partidos vivos a la vez que acepta el servidor (por encima, los logons nuevos se rechazan con un aviso claro). Por defecto 100. */
+  maxPartidos?: number;
+  /** Tamaño máximo de una grabación en MB (pasado, deja de grabar ese partido; el directo sigue). Por defecto 64. */
+  maxGrabacionMb?: number;
   puertos: { ingesta: number; salida: number; extras: number };
   /**
    * Dónde está la web de vídeo de las cámaras y los parámetros fijos que hay que
@@ -87,6 +91,8 @@ export function leeConfig(env: NodeJS.ProcessEnv = process.env): Config {
     carpetaGrabaciones: env.CARPETA_GRABACIONES || './replays',
     extraProrroga: entero(env.TIEMPOS_MUERTOS_PRORROGA, 1, 'TIEMPOS_MUERTOS_PRORROGA'),
     minutosInactividad: entero(env.MINUTOS_INACTIVIDAD, 30, 'MINUTOS_INACTIVIDAD'),
+    maxPartidos: Math.max(1, entero(env.MAX_PARTIDOS, 100, 'MAX_PARTIDOS')),
+    maxGrabacionMb: Math.max(1, entero(env.MAX_GRABACION_MB, 64, 'MAX_GRABACION_MB')),
     // Fijos a propósito: el cliente deriva el 5200 sustituyendo ":5100" en su URL.
     puertos: { ingesta: 5100, salida: 5200, extras: 5101 },
     camaras: {

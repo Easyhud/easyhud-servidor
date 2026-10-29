@@ -42,6 +42,9 @@ const AGENTES: Record<string, string> = {
   Terra: 'Waylay',
   Pine: 'Veto',
   Iris: 'Miks',
+  // Adaptado de ValoSpectra/Spectra-Server (Elastic License 2.0) — src/util/ValorantInternalTranslator.ts (commit e5be940, 2026-10-27).
+  // Hush: nombre interno «Paprika», rol Duelist.
+  Paprika: 'Hush',
 };
 
 /** Quita el sufijo `_PC_C` con el que a veces llega el código del agente. */
@@ -68,8 +71,11 @@ export function agenteNormalizado(interno: string | undefined): string {
 const ICONOS_KILLFEED: Record<string, string> = Object.fromEntries(
   Object.entries(AGENTES).map(([interno, visible]) => [`TX_Killfeed_${visible}`, interno]),
 );
-// Miks tiene el icono con el nombre interno, no con el visible.
-ICONOS_KILLFEED['TX_Killfeed_Iris'] = 'Iris';
+// Los agentes más nuevos (Miks, Hush) traen el icono con el nombre INTERNO, no con el visible: el original los da de
+// alta con `TX_Killfeed_Iris` / `TX_Killfeed_Paprika`. Se aceptan las dos formas para TODOS los agentes, así el
+// siguiente agente nuevo casa lo traiga como lo traiga.
+// Adaptado de ValoSpectra/Spectra-Server (Elastic License 2.0) — src/util/ValorantInternalTranslator.ts (enum Agents).
+for (const interno of Object.keys(AGENTES)) ICONOS_KILLFEED[`TX_Killfeed_${interno}`] ??= interno;
 
 export function agenteDeIconoKillfeed(icono: string): string | undefined {
   return ICONOS_KILLFEED[icono];
@@ -164,7 +170,9 @@ const MAPAS: Record<string, string> = {
   Pitt: 'Pearl',
   Jam: 'Lotus',
   Juliett: 'Sunset',
-  Range: 'Practice Range',
+  // El campo de tiro se llama «The Range» (así lo llama valorant-api, de donde el panel saca el arte) y el panel guarda
+  // su imagen como 	herange; con «Practice Range» no casaba con ninguna de las dos.
+  Range: 'The Range',
   HURM_Alley: 'District',
   HURM_Yard: 'Piazza', // antes salía con un espacio final; el panel ya recortaba
   HURM_Bowl: 'Kasbah',

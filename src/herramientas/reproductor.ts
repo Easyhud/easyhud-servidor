@@ -5,7 +5,7 @@
  *   npm run reproduce -- -game <fichero.replay> [-server http://localhost:5100]
  *                        [-instant | -delay <ms> | -timestamps | -manual] [-token <t>]
  *
- * Modos: -instant todo de golpe (defecto); -delay a intervalos fijos (500 ms
+ * Modos: -instant todo lo más rápido que admite el servidor (defecto); -delay a intervalos fijos (500 ms
  * por defecto); -timestamps respetando los tiempos grabados; -manual por
  * teclado (Intro = siguiente, un número N = los N siguientes, "go" = el resto,
  * "exit" = salir).
@@ -81,7 +81,12 @@ function envia(p: Record<string, unknown>): boolean {
 async function reproduce(): Promise<void> {
   if (modo === 'manual') return manual();
   let anterior: number | undefined;
+  let enviados = 0;
   for (const p of paquetes) {
+    // El servidor descarta lo que pasa de ~300 paquetes por segundo (protege el directo de un cliente roto): -instant
+    // va «todo lo rápido que deja», con una pausa corta cada 100 paquetes.
+    if (modo === 'instant' && enviados > 0 && enviados % 100 === 0) await espera(400);
+    enviados += 1;
     if (modo === 'delay') await espera(retardo);
     if (modo === 'timestamps') {
       const t = typeof p.timestamp === 'number' ? p.timestamp : undefined;

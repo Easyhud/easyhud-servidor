@@ -26,6 +26,7 @@ import {
   marcaObservado,
   plantaSpike,
   quitaDisponibilidad,
+  recuerdaTerminada,
   restauraVida,
   reiniciaParaPartidaNueva,
   reiniciaPorOrden,
@@ -49,11 +50,21 @@ import {
   RONDA_CAMBIO_SWIFT,
 } from './creacion.ts';
 import { nombreMapa } from './tablas.ts';
+import { LIMITES, linea, texto } from './saneado.ts';
 import { fijaBandos, rondaEnJuego } from './bandos.ts';
 import { intercambiaIdentidad, intercambiaRegistrados, vinculaPorRoster } from './vinculo.ts';
 import type { Equipo, Evento, Paquete, Partido, TipoRonda } from './tipos.ts';
 
 const LIMITE_RONDA_MS = 99_000;
+/** Lo más alto que puede valer una ronda o un marcador de rondas. Un número mayor es un cliente roto, no una partida. */
+const MAX_RONDAS = 99;
+/** Un `map`, un `game_mode` y un `match_start` dentro de este margen forman una «ráfaga» (la reenvía el observador al reconectar). */
+const RAFAGA_MS = 5_000;
+const MAX_ID_PARTIDA = 64;
+const MAX_MODO = 20;
+const MAX_MAPA = 40;
+const MAX_ROTULO_MS = 3_600_000;
+const FASE_VALIDA = /^[A-Za-z_]{1,24}$/;
 
 export interface Resultado {
   estado: Partido;
@@ -155,11 +166,16 @@ function aplica(p: Partido, e: Evento): Efecto {
       return HECHO;
 
     case 'match_start': {
-      const id = typeof d === 'string' ? d : String(d ?? '');
+      const id = typeof d === 'string' ? d : typeof d === 'number' && Number.isFinite(d) ? String(d) : '';
+      if (id.length > MAX_ID_PARTIDA) return NADA; // un id de partida de VALORANT es un UUID: esto no lo es
+      // Tras el menú, el observador puede reenviar el `match_start` (y el mapa y el modo) de una partida que ya
+      // terminó o que el operador descartó: no vale, y lo que llegó en la misma ráfaga tampoco.
+      if (id !== '' && p.interno.idsTerminados.includes(id)) return si(restauraRafaga(p, t));
       // Otra partida en el mismo partido (remake sin game_end, grupo retomado):
       // se empieza de cero. El mismo id (reconexión) no toca nada, y uno
       // vacío no borra el que hay: los jugadores entran por matchId.
       if (id !== '' && p.matchId !== '' && id !== p.matchId) {
+        recuerdaTerminada(p, p.matchId);
         reiniciaParaPartidaNueva(p);
         vinculaPorRoster(p);
       }
@@ -172,12 +188,14 @@ function aplica(p: Partido, e: Evento): Efecto {
       return HECHO;
     }
     case 'map':
-      p.map = nombreMapa(d);
+      guardaAntesDeRafaga(p, t);
+      p.map = nombreMapa(d).slice(0, MAX_MAPA);
       return HECHO;
     case 'game_mode':
+      if (typeof d !== 'string' || d === '' || d.length > MAX_MODO) return NADA;
+      guardaAntesDeRafaga(p, t);
       aplicaModo(p, d);
       return HECHO;
-
     case 'round_info':
       return aplicaFase(p, dato, t);
     case 'score':
@@ -242,8 +260,8 @@ function aplica(p: Partido, e: Evento): Efecto {
 
 /* ── Modo de juego ──────────────────────────────────────────────────────── */
 
-function aplicaModo(p: Partido, d: unknown): void {
-  p.matchType = typeof d === 'string' ? d : String(d);
+function aplicaModo(p: Partido, d: string): void {
+  p.matchType = d;
   if (p.matchType === 'swift') {
     p.switchRound = RONDA_CAMBIO_SWIFT;
     p.firstOtRound = PRIMERA_PRORROGA_SWIFT;
@@ -253,12 +271,34 @@ function aplicaModo(p: Partido, d: unknown): void {
   }
 }
 
+/* ── Mapa y modo reenviados por un observador que vuelve del menú ───────── */
+
+/** Antes de aplicar un `map`/`game_mode`, se recuerda lo que había (sólo al abrirse una ráfaga nueva). */
+function guardaAntesDeRafaga(p: Partido, ahora: number): void {
+  const a = p.interno.antesDeRafaga;
+  if (a !== undefined && ahora - a.en <= RAFAGA_MS) return;
+  p.interno.antesDeRafaga = { map: p.map, matchType: p.matchType, switchRound: p.switchRound, firstOtRound: p.firstOtRound, en: ahora };
+}
+
+/** Un `match_start` caducado: el mapa y el modo de su misma ráfaga eran de la partida vieja. Devuelve si cambió algo. */
+function restauraRafaga(p: Partido, ahora: number): boolean {
+  const a = p.interno.antesDeRafaga;
+  p.interno.antesDeRafaga = undefined;
+  if (a === undefined || ahora - a.en > RAFAGA_MS) return false;
+  const cambio = p.map !== a.map || p.matchType !== a.matchType;
+  p.map = a.map;
+  p.matchType = a.matchType;
+  p.switchRound = a.switchRound;
+  p.firstOtRound = a.firstOtRound;
+  return cambio;
+}
+
 /* ── Fases de la ronda ──────────────────────────────────────────────────── */
 
 function aplicaFase(p: Partido, d: Record<string, unknown>, ahora: number): Efecto {
   const faseAnterior = p.roundPhase;
-  if (esNumero(d.roundNumber)) p.roundNumber = d.roundNumber;
-  if (typeof d.roundPhase === 'string') {
+  if (esNumero(d.roundNumber) && Number.isInteger(d.roundNumber) && d.roundNumber >= 0 && d.roundNumber <= MAX_RONDAS) p.roundNumber = d.roundNumber;
+  if (typeof d.roundPhase === 'string' && FASE_VALIDA.test(d.roundPhase)) {
     p.roundPhase = d.roundPhase;
     // La pausa detectada por pantalla no puede sobrevivir a la compra: si el juego pasó a combate, ya no hay pausa.
     if (d.roundPhase !== 'shopping') pausaVisual(p, false, ahora);
@@ -297,6 +337,12 @@ function aplicaFase(p: Partido, d: Record<string, unknown>, ahora: number): Efec
       p.roundNumber = rondaEnJuego(p);
       fijaBandos(p, p.roundNumber);
       revisaAgentesDuplicados(p);
+      // Un `combat` repetido de la MISMA ronda (el observador que reconecta reenvía el último estado) no vuelve a
+      // empezar la cuenta de la ronda: el tope de 99 s se alargaba (una ronda ganada por tiempo salía «por kills»), volvía
+      // a ponerse tras plantar la spike y se retiraba el rótulo que el operador acababa de poner. El original sí lo hace.
+      // Adaptado de ValoSpectra/Spectra-Server (Elastic License 2.0) — model/Match.ts (case "combat"), corregido.
+      if (faseAnterior === 'combat' && p.interno.combateRonda === p.roundNumber) break;
+      p.interno.combateRonda = p.roundNumber;
       p.roundTimeoutTime = ahora + LIMITE_RONDA_MS;
       p.interno.limiteRonda = p.roundTimeoutTime;
       p.interno.finRonda = undefined;
@@ -311,6 +357,7 @@ function aplicaFase(p: Partido, d: Record<string, unknown>, ahora: number): Efec
       break;
     case 'game_end':
       p.isRunning = false;
+      recuerdaTerminada(p, p.matchId);
       detenTodo(p);
       return { cambiado: true, finDeMapa: true };
   }
@@ -329,8 +376,10 @@ function aplicaFase(p: Partido, d: Record<string, unknown>, ahora: number): Efec
 function aplicaMarcadorRondas(p: Partido, d: Record<string, unknown>, ahora: number): void {
   const e0 = p.teams.find((x) => x.ingameTeamId === 0);
   const e1 = p.teams.find((x) => x.ingameTeamId === 1);
-  const r0 = esNumero(d.team_0) ? d.team_0 : p.interno.ultimoMarcador[0];
-  const r1 = esNumero(d.team_1) ? d.team_1 : p.interno.ultimoMarcador[1];
+  // Un marcador fuera de rango (negativo, con decimales o pasado de MAX_RONDAS) es un dato roto: se queda el anterior.
+  const enRango = (v: unknown, anterior: number): number => (esNumero(v) && Number.isInteger(v) && v >= 0 && v <= MAX_RONDAS ? v : anterior);
+  const r0 = enRango(d.team_0, p.interno.ultimoMarcador[0]);
+  const r1 = enRango(d.team_1, p.interno.ultimoMarcador[1]);
   const [previo0, previo1] = p.interno.ultimoMarcador;
 
   let ganador: Equipo | undefined;
@@ -429,14 +478,14 @@ function aplicaRotulo(p: Partido, d: Record<string, unknown>, ahora: number): vo
     p.interno.rotuloHasta = undefined;
     return;
   }
-  const duracion = esNumero(d.duration) && d.duration > 0 ? d.duration : null;
+  const duracion = esNumero(d.duration) && d.duration > 0 ? Math.min(MAX_ROTULO_MS, d.duration) : null;
   p.toastInfo = {
     active: true,
-    title: typeof d.title === 'string' ? d.title : '',
-    message: typeof d.message === 'string' ? d.message : '',
+    title: linea(d.title, LIMITES.tituloRotulo) ?? '',
+    message: texto(d.message, LIMITES.mensajeRotulo) ?? '',
     duration: duracion,
     eventLogoEnabled: d.eventLogoEnabled !== false,
-    selectedTeam: typeof d.selectedTeam === 'string' ? d.selectedTeam : undefined,
+    selectedTeam: d.selectedTeam === 'left' || d.selectedTeam === 'right' || d.selectedTeam === 'none' ? d.selectedTeam : undefined,
   };
   p.interno.rotuloHasta = duracion === null ? undefined : ahora + duracion;
 }

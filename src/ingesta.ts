@@ -17,8 +17,9 @@ import type { Server, Socket } from 'socket.io';
 import type { CamaraConfig, Central } from './central.ts';
 import type { Config } from './config.ts';
 import { alarma, error, log } from './log.ts';
-import { emite, leeCarga, respondeYCorta } from './mensajes.ts';
+import { Limitador, emite, escucha, identificadorValido, leeCarga, respondeYCorta } from './mensajes.ts';
 import { logonCompleto } from './partida/creacion.ts';
+import { TIPOS_CONOCIDOS } from './partida/reductor.ts';
 import type { DatosCreacion, Paquete } from './partida/tipos.ts';
 import { validaToken } from './token.ts';
 import { VERSION_SERVIDOR, clienteCompatible, motivoIncompatible } from './version.ts';
@@ -37,6 +38,13 @@ interface Sesion {
 }
 
 const MAX_TEMPORIZADOR_MS = 2 ** 31 - 1; // ~24,8 días: tope de setTimeout
+
+/** Jugadores (sockets) que puede tener a la vez un grupo: 10 jugadores, algún suplente y las reconexiones a medias. */
+const MAX_JUGADORES_POR_GRUPO = 30;
+/** Lo más grande que puede ser la sala de Riot que manda el observador (en texto JSON). */
+const MAX_SALA_BYTES = 64 * 1024;
+/** A cuántos jugadores como máximo se puede llamar de una vez. */
+const MAX_LLAMADOS = 60;
 
 /** "Nombre#TAG" de Riot: nombre 3–16 (con espacios), tag 3–5 alfanuméricos. Con holgura. */
 const NOMBRE_CAMARA = /^[^#\r\n]{1,32}#[A-Za-z0-9]{2,8}$/;
@@ -63,13 +71,18 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
     let puuidPresencia = '';
     /** Descartes ya anotados en el log de este socket (uno por motivo y tipo: un cliente roto no llena el log). */
     const avisados = new Set<string>();
+    /** Ritmo de los mensajes de control (logon, presencia, sala…) y de los de datos de juego. Ver Limitador. */
+    const general = new Limitador(60, 20);
+    const ritmoDatos = new Limitador(600, 300);
+    const en = (evento: string, fn: (msg: unknown, ack?: unknown) => void) => escucha(socket, evento, fn, general);
+    const enLibre = (evento: string, fn: (msg: unknown, ack?: unknown) => void) => escucha(socket, evento, fn);
 
     /* ── Presencia ─────────────────────────────────────────────────────── */
 
-    socket.on('cliente_presente', (msg, ack?: unknown) => {
+    en('cliente_presente', (msg, ack) => {
       const d = leeCarga(msg);
       const puuid = d?.puuid;
-      if (typeof puuid !== 'string' || puuid === '') return;
+      if (!identificadorValido(puuid)) return;
       // Lo que el exe cuenta de sí mismo (los antiguos no mandan nada: salen «sin diagnóstico»).
       if (d?.estado !== undefined) central.diagnostico(puuid, d.estado);
       // El mismo socket late ahora con otro puuid (cambio de cuenta): el viejo se deja caer.
@@ -89,7 +102,7 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
     });
 
     // El programa del jugador manda su informe completo (la «caja negra»), a petición o por su botón.
-    socket.on('informe_cliente', (msg, ack?: unknown) => {
+    en('informe_cliente', (msg, ack) => {
       const d = leeCarga(msg);
       const puuid = typeof d?.puuid === 'string' && d.puuid !== '' ? d.puuid : puuidPresencia;
       const informe = d?.informe;
@@ -100,7 +113,7 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
 
     /* ── Logon del observador ──────────────────────────────────────────── */
 
-    socket.on('obs_logon', (msg) => {
+    en('obs_logon', (msg) => {
       if (logonIntentado || sesiones.has(socket.id)) return;
       const d = leeCarga(msg);
       if (!d) {
@@ -115,6 +128,9 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
 
       if (d.type !== 'authenticate' || !logonCompleto(d)) return rechaza('Invalid packet.');
       if (!clienteCompatible(d.clientVersion)) return rechaza(motivoIncompatible(d.clientVersion));
+      if (!identificadorValido(d.groupCode)) {
+        return rechaza('Group code not accepted: it is empty, longer than 64 characters or has hidden characters. Copy it again from your Easy HUD account.');
+      }
 
       const grupo = d.groupCode as string;
       let caducidad: number | undefined;
@@ -130,26 +146,47 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
         caducidad = v.exp;
       }
 
+      // Un logon mal montado se dice claro AHORA, no se descubre a mitad del directo con un equipo vacío.
+      const [izq, der] = [d.leftTeam, d.rightTeam] as [{ attackStart?: unknown }, { attackStart?: unknown }];
+      if (izq.attackStart === der.attackStart) {
+        return rechaza('Both teams start on the same side. One team must start attacking and the other defending: check the team setup in Easy HUD and open the observer again.');
+      }
+
       // Crear, reconectar o retomar.
-      let reason: string;
-      const existente = central.partido(grupo);
-      if (!existente) {
-        reason = central.crea(datosCreacion(d), cabeceraGrabacion(d), socket.id).secreto;
-      } else if (typeof d.groupSecret === 'string' && d.groupSecret !== '' && d.groupSecret === existente.secreto) {
-        existente.dueno = socket.id; // el mismo observador que vuelve: el estado no se toca
-        reason = 'reconnected';
-      } else if (existente.dueno !== null) {
-        return rechaza(`Game with Group Code ${grupo} exists and is still live.`);
-      } else {
-        // Huérfano: lo retoma este observador, conservando el estado.
-        reason = central.retoma(grupo, socket.id) ?? central.crea(datosCreacion(d), cabeceraGrabacion(d), socket.id).secreto;
+      let reason = '';
+      try {
+        const existente = central.partido(grupo);
+        if (!existente && central.completo(grupo)) {
+          return rechaza(`The server is at its limit of ${config.maxPartidos ?? 100} live matches. Wait a few minutes and try again; if it keeps happening, tell the organizer.`);
+        }
+        if (!existente) {
+          reason = central.crea(datosCreacion(d), cabeceraGrabacion(d), socket.id).secreto;
+        } else if (typeof d.groupSecret === 'string' && d.groupSecret !== '' && d.groupSecret === existente.secreto) {
+          // El mismo observador que vuelve: el estado no se toca. Si el socket anterior sigue abierto (medio muerto, o el
+          // proceso viejo aún vivo) se corta: dos sockets escribiendo en el mismo partido mezclarían dos GEP distintos.
+          const anterior = existente.dueno;
+          if (anterior !== null && anterior !== socket.id) {
+            log(`observador de ${grupo}: el socket anterior se cierra, lo sustituye el que vuelve con el secreto`);
+            sesiones.get(anterior)?.socket.disconnect(true);
+          }
+          existente.dueno = socket.id;
+          reason = 'reconnected';
+        } else if (existente.dueno !== null) {
+          return rechaza(`Game with Group Code ${grupo} exists and is still live.`);
+        } else {
+          // Huérfano: lo retoma este observador, conservando el estado.
+          reason = central.retoma(grupo, socket.id) ?? central.crea(datosCreacion(d), cabeceraGrabacion(d), socket.id).secreto;
+        }
+      } catch (e) {
+        error(`no se pudo montar el partido del grupo ${grupo}`, e);
+        return rechaza('The server could not start the match for this group. Try again in a moment; if it keeps failing, tell the organizer.');
       }
 
       const sesion: Sesion = {
         socket,
         rol: 'observador',
         grupo,
-        nombre: typeof d.obsName === 'string' ? d.obsName : '',
+        nombre: typeof d.obsName === 'string' ? d.obsName.slice(0, 64) : '',
         playerId: '',
       };
       if (caducidad !== undefined) {
@@ -167,7 +204,7 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
 
     /* ── Logon del jugador ─────────────────────────────────────────────── */
 
-    socket.on('aux_logon', (msg) => {
+    en('aux_logon', (msg) => {
       if (logonIntentado || sesiones.has(socket.id)) return;
       const d = leeCarga(msg);
       if (!d) {
@@ -191,12 +228,18 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
       const partido = porGrupo ?? central.partidoPorMatchId(matchId);
       if (!partido) return rechaza(`Game with Match ID ${String(d.matchId)} not found.`);
 
+      let jugadoresDelGrupo = 0;
+      for (const s of sesiones.values()) if (s.grupo === partido.grupo && s.rol === 'jugador') jugadoresDelGrupo += 1;
+      if (jugadoresDelGrupo >= MAX_JUGADORES_POR_GRUPO) {
+        return rechaza(`This group already has ${MAX_JUGADORES_POR_GRUPO} players connected. Close any extra copies of Easy HUD and try again.`);
+      }
+
       const sesion: Sesion = {
         socket,
         rol: 'jugador',
         grupo: partido.grupo,
-        nombre: typeof d.name === 'string' ? d.name : '',
-        playerId: typeof d.playerId === 'string' ? d.playerId : '',
+        nombre: typeof d.name === 'string' ? d.name.slice(0, 64) : '',
+        playerId: identificadorValido(d.playerId) ? d.playerId : '',
       };
       sesiones.set(socket.id, sesion);
       log(`jugador ${sesion.nombre} en ${sesion.grupo}`);
@@ -265,7 +308,8 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
           paquete.data = { ...(d.data as Record<string, unknown>), playerId: s.playerId };
         }
       }
-      if (s.rol === 'jugador') central.datoDeJugador(s.grupo, s.playerId, d.type);
+      // El tipo de paquete es texto del cliente: sólo los conocidos se cuentan por separado (no se llena la memoria con tipos inventados).
+      if (s.rol === 'jugador') central.datoDeJugador(s.grupo, s.playerId, TIPOS_CONOCIDOS.has(d.type) ? d.type : 'otro');
       else if (d.type === 'scoreboard' && typeof (d.data as { playerId?: unknown } | null)?.playerId === 'string') {
         central.marcadorDe(s.grupo, (d.data as { playerId: string }).playerId);
       }
@@ -276,10 +320,10 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
         error(`procesando ${canal} de ${s.nombre}`, e);
       }
     };
-    socket.on('obs_data', (msg) => recibeDatos(msg, 'obs_data'));
-    socket.on('aux_data', (msg) => recibeDatos(msg, 'aux_data'));
+    escucha(socket, 'obs_data', (msg) => recibeDatos(msg, 'obs_data'), ritmoDatos);
+    escucha(socket, 'aux_data', (msg) => recibeDatos(msg, 'aux_data'), ritmoDatos);
 
-    socket.on('obs_lobby', (msg) => {
+    en('obs_lobby', (msg) => {
       const s = sesiones.get(socket.id);
       if (!s || s.rol !== 'observador') return;
       const d = leeCarga(msg);
@@ -290,10 +334,14 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
         return;
       }
       if (typeof sala !== 'object' || sala === null || Array.isArray(sala)) return;
+      if (JSON.stringify(sala).length > MAX_SALA_BYTES) {
+        log(`obs_lobby de ${s.grupo} descartado: la sala pesa más de ${MAX_SALA_BYTES / 1024} KB`);
+        return;
+      }
       central.guardaSala(s.grupo, sala as Record<string, unknown>);
     });
 
-    socket.on('llamar_jugadores', (msg) => {
+    en('llamar_jugadores', (msg) => {
       const s = sesiones.get(socket.id);
       if (!s || s.rol !== 'observador') {
         log('llamar_jugadores de un socket que no es observador: ignorado');
@@ -302,22 +350,23 @@ export function montaIngesta(io: Server, central: Central, config: Config): Inge
       const d = leeCarga(msg);
       if (!d || !Array.isArray(d.puuids)) return;
       // Se sigue llamando a quien aún no tenga el programa abierto; una lista vacía cancela.
-      central.llamaHasta(s.grupo, d.puuids.filter((p): p is string => typeof p === 'string'));
+      const puuids = d.puuids.slice(0, MAX_LLAMADOS);
+      central.llamaHasta(s.grupo, puuids.filter(identificadorValido));
       const avisados: string[] = [];
-      for (const puuid of d.puuids) {
+      for (const puuid of puuids) {
         if (typeof puuid !== 'string') continue;
         const destino = presencia.get(puuid);
         if (!destino) continue;
         emite(destino, 'te_llaman', central.llamada(s.grupo));
         avisados.push(puuid);
       }
-      log(`llamada en ${s.grupo}: ${avisados.length}/${d.puuids.length} jugadores con el programa abierto, sala ${central.codigoSala(s.grupo) || '(sin código aún)'}`);
+      log(`llamada en ${s.grupo}: ${avisados.length}/${puuids.length} jugadores con el programa abierto, sala ${central.codigoSala(s.grupo) || '(sin código aún)'}`);
       emite(socket, 'llamar_jugadores_ack', { avisados });
     });
 
     /* ── Desconexión ───────────────────────────────────────────────────── */
 
-    socket.on('disconnect', () => {
+    enLibre('disconnect', () => {
       if (puuidPresencia !== '' && presencia.get(puuidPresencia) === socket) {
         log(`presencia: ${puuidPresencia.slice(0, 8)}… desconectada`);
         presencia.delete(puuidPresencia);

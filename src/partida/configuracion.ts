@@ -8,7 +8,8 @@
  *  - el partido en curso, si lo hay.
  */
 
-import type { EquipoGuardado, MemoriaGrupo, Partido } from './tipos.ts';
+import { aplicaHerramientas, fusionaRecuerdo, normalizaParche } from './saneado.ts';
+import type { EntradaMapa, EquipoGuardado, MemoriaGrupo, Partido } from './tipos.ts';
 import { vinculaPorRoster } from './vinculo.ts';
 
 const esObjeto = (v: unknown): v is Record<string, unknown> =>
@@ -26,52 +27,51 @@ export function memoriaVacia(): MemoriaGrupo {
   return { equipos: [null, null] };
 }
 
-/** Aplica a la memoria del grupo la parte del parche que sobrevive a los mapas. */
+/**
+ * Aplica a la memoria del grupo la parte del parche que sobrevive a los mapas. El parche se normaliza antes
+ * (`normalizaParche`): sólo entra lo que tiene el tipo y el tamaño correctos.
+ */
 export function aplicaParcheGrupo(m: MemoriaGrupo, parche: Record<string, unknown>): void {
-  const serie = parche.seriesInfo;
-  if (esObjeto(serie)) {
+  const { limpio } = normalizaParche(parche);
+
+  const serie = limpio.seriesInfo;
+  if (serie) {
     m.serie ??= { needed: 1, wonLeft: 0, wonRight: 0, mapInfo: [] };
-    if (esNumero(serie.needed)) m.serie.needed = serie.needed;
-    if (esNumero(serie.wonLeft)) m.serie.wonLeft = serie.wonLeft;
-    if (esNumero(serie.wonRight)) m.serie.wonRight = serie.wonRight;
-    if (Array.isArray(serie.mapInfo)) m.serie.mapInfo = structuredClone(serie.mapInfo);
+    if (serie.needed !== undefined) m.serie.needed = serie.needed;
+    if (serie.wonLeft !== undefined) m.serie.wonLeft = serie.wonLeft;
+    if (serie.wonRight !== undefined) m.serie.wonRight = serie.wonRight;
+    if (serie.mapInfo !== undefined) m.serie.mapInfo = structuredClone(serie.mapInfo) as EntradaMapa[];
   }
 
   // Tiempos muertos: sin esto, cada mapa nuevo volvía al máximo y la duración
   // que manda el logon del cliente (2 y 60 s fijos), y lo que el operador
   // configuró antes de que hubiera partido se perdía.
-  if (esNumero(parche.timeoutDuration) && parche.timeoutDuration > 0) {
-    m.tiempos = { ...m.tiempos, duracion: parche.timeoutDuration };
-  }
-  const contador = parche.timeoutCounter;
-  if (esObjeto(contador) && contador.max !== undefined && contador.max !== null) {
-    const max = Math.floor(Number(contador.max));
-    if (Number.isFinite(max) && max >= 0) m.tiempos = { ...m.tiempos, max };
-  }
+  if (limpio.timeoutDuration !== undefined) m.tiempos = { ...m.tiempos, duracion: limpio.timeoutDuration };
+  if (limpio.timeoutCounter?.max !== undefined) m.tiempos = { ...m.tiempos, max: limpio.timeoutCounter.max };
 
-  const camaras = parche.playercamsInfo;
-  if (esObjeto(camaras)) {
+  const camaras = limpio.playercamsInfo;
+  if (camaras) {
     m.camaras ??= {};
-    if (typeof camaras.enable === 'boolean') m.camaras.enable = camaras.enable;
-    if (typeof camaras.identifier === 'string') m.camaras.identifier = camaras.identifier;
+    if (camaras.enable !== undefined) m.camaras.enable = camaras.enable;
+    if (camaras.identifier !== undefined) m.camaras.identifier = camaras.identifier;
   }
 
-  const equipos = parche.equipos;
-  if (Array.isArray(equipos)) {
+  if (limpio.equipos) {
     for (const i of [0, 1] as const) {
-      const e = equipos[i];
-      if (!esObjeto(e)) continue;
+      const e = limpio.equipos[i];
+      if (!e) continue;
       const guardado: EquipoGuardado = m.equipos[i] ?? {};
-      if (textoNoVacio(e.name)) guardado.name = e.name;
-      if (textoNoVacio(e.tricode)) guardado.tricode = e.tricode;
-      if (typeof e.url === 'string') guardado.url = e.url;
-      const puuids = puuidsDe(e);
-      if (puuids !== undefined) guardado.puuids = puuids;
+      if (e.name !== undefined) guardado.name = e.name;
+      if (e.tricode !== undefined) guardado.tricode = e.tricode;
+      if (e.url !== undefined) guardado.url = e.url;
+      if (e.puuids !== undefined) guardado.puuids = [...e.puuids];
       m.equipos[i] = guardado;
     }
   }
-}
 
+  m.herramientas ??= {};
+  fusionaRecuerdo(m.herramientas, limpio);
+}
 /**
  * Pone nombre/tricode/logo guardados en los equipos del partido, por posición,
  * y los puuids registrados de cada lado (el vínculo por roster lo aplica quien llama).
@@ -89,69 +89,30 @@ export function aplicaEquiposGuardados(p: Partido, equipos: ReadonlyArray<unknow
   }
 }
 
-/** Fusión superficial de un subobjeto de configuración (sin tocar las claves que no vienen). */
-function fusiona(destino: Record<string, unknown>, origen: unknown): void {
-  if (!esObjeto(origen)) return;
-  for (const [k, v] of Object.entries(origen)) destino[k] = structuredClone(v);
-}
-
 /**
- * Aplica el parche al partido. Devuelve si cambió algo.
+ * Aplica el parche al partido (normalizado antes). Devuelve si cambió algo.
  *
  * Ajuste de `timeoutCounter.max`: si el máximo sube, los restantes de cada
  * equipo suben lo mismo, y si baja, se recortan al nuevo máximo.
  */
 export function aplicaParchePartido(p: Partido, parche: Record<string, unknown>): boolean {
-  let cambio = false;
+  const { limpio } = normalizaParche(parche);
   const t = p.tools;
+  let cambio = aplicaHerramientas(t, limpio);
 
-  if (esObjeto(parche.tournamentInfo)) {
-    fusiona(t.tournamentInfo, parche.tournamentInfo);
-    cambio = true;
-  }
-  if (esObjeto(parche.seriesInfo)) {
-    fusiona(t.seriesInfo, parche.seriesInfo);
-    cambio = true;
-  }
-  if (esObjeto(parche.sponsorInfo)) {
-    fusiona(t.sponsorInfo, parche.sponsorInfo);
-    cambio = true;
-  }
-  if (esObjeto(parche.watermarkInfo)) {
-    fusiona(t.watermarkInfo, parche.watermarkInfo);
-    t.watermarkInfo.brandWatermark = false;
-    cambio = true;
-  }
-
-  if (esNumero(parche.timeoutDuration) && parche.timeoutDuration > 0) {
-    t.timeoutDuration = parche.timeoutDuration;
-    cambio = true;
-  }
-
-  const contador = parche.timeoutCounter;
-  if (esObjeto(contador) && contador.max !== undefined && contador.max !== null) {
-    const nuevo = Math.floor(Number(contador.max));
-    if (Number.isFinite(nuevo) && nuevo >= 0) {
-      const diferencia = nuevo - t.timeoutMax;
-      const r = p.interno.tiempos.restantes;
-      for (const i of [0, 1] as const) {
-        r[i] = Math.min(nuevo, Math.max(0, r[i] + Math.max(0, diferencia)));
-      }
-      t.timeoutMax = nuevo;
-      cambio = true;
+  const nuevo = limpio.timeoutCounter?.max;
+  if (nuevo !== undefined) {
+    const diferencia = nuevo - t.timeoutMax;
+    const r = p.interno.tiempos.restantes;
+    for (const i of [0, 1] as const) {
+      r[i] = Math.min(nuevo, Math.max(0, r[i] + Math.max(0, diferencia)));
     }
-  }
-
-  const camaras = parche.playercamsInfo;
-  if (esObjeto(camaras)) {
-    if (typeof camaras.enable === 'boolean') t.playercamsInfo.enable = camaras.enable;
-    if (typeof camaras.identifier === 'string') t.playercamsInfo.identifier = camaras.identifier;
-    // `enabledPlayers` NO se acepta del panel: lo decide el servidor según quién publica.
+    t.timeoutMax = nuevo;
     cambio = true;
   }
 
-  if (Array.isArray(parche.equipos)) {
-    aplicaEquiposGuardados(p, parche.equipos);
+  if (limpio.equipos) {
+    aplicaEquiposGuardados(p, limpio.equipos);
     vinculaPorRoster(p);
     cambio = true;
   }
